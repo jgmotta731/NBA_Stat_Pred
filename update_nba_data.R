@@ -5,9 +5,6 @@ library(hoopR)
 library(arrow)
 library(stringr)
 
-# ---------------------------------------------------
-# Load Player Gamelogs
-# ---------------------------------------------------
 player_raw <- load_nba_player_box(
   seasons = 2020:as.numeric(format(Sys.Date(), "%Y"))) %>%
   select(everything(), -game_date_time, -athlete_id, -team_id,
@@ -20,9 +17,6 @@ player_raw <- load_nba_player_box(
          -opponent_team_color, -opponent_team_alternate_color,
          -reason, -team_display_name)
 
-# ---------------------------------------------------
-# Load Schedule of Upcoming Games
-# ---------------------------------------------------
 schedule <- load_nba_schedule(as.numeric(format(Sys.Date(), "%Y"))) %>%
   select(home_abbreviation, away_abbreviation, game_date, season_type) %>%
   filter(game_date >= Sys.Date()) %>%
@@ -39,8 +33,5 @@ schedule <- load_nba_schedule(as.numeric(format(Sys.Date(), "%Y"))) %>%
     ) %>%
   select(-season_type)
 
-# ---------------------------------------------------
-# Write out Parquets
-# ---------------------------------------------------
-write_parquet(player_raw,  "C:/Users/jgmot/NBA/nba_gamelogs.parquet")
-write_parquet(schedule,    "C:/Users/jgmot/NBA/nba_schedule.parquet")
+write_parquet(player_raw, "nba_gamelogs.parquet")
+write_parquet(schedule, "nba_schedule.parquet")

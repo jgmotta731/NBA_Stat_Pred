@@ -1,35 +1,23 @@
+# -*- coding: utf-8 -*-
 """
-Created on Sun Apr 20 2025
+Created on Mon Apr 21 17:15:53 2025
 
 @author: jgmot
 """
 
-# ---------------------------------------------------
-# Imports & Seed Setup
-# ---------------------------------------------------
-import os, random, warnings, json
+# predict_nba_bins.py
+import os, joblib, warnings, sys
 from datetime import date, timedelta
-
 import numpy as np
 import pandas as pd
-import joblib
-import torch
 import xgboost as xgb
-from sklearn.preprocessing import LabelEncoder
+import torch
 from nba_api.stats.static import players
 from nba_model import NBAStatPredictor
 from torch.serialization import add_safe_globals
 
 warnings.filterwarnings("ignore")
-
 SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-os.environ["PYTHONHASHSEED"] = str(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
 # ---------------------------------------------------
 # Load & Prepare Data
@@ -106,20 +94,16 @@ for w in [3, 5, 10]:
 # Choose one window (10‑game here) as the “main” defence‑rank column
 gamelogs["opponent_defense_rank"] = gamelogs["opponent_defense_rank_10"]
 
-# ---------------------------------------------------
-# Label Encoding
-# ---------------------------------------------------
-player_le = LabelEncoder()
-team_le = LabelEncoder()
-opponent_le = LabelEncoder()
-gamelogs['player_id']   = player_le.fit_transform(gamelogs['athlete_display_name'])
-gamelogs['team_id']     = team_le.fit_transform(gamelogs['team_abbreviation'])
-gamelogs['opponent_id'] = opponent_le.fit_transform(gamelogs['opponent_team_abbreviation'])
+# -----------------------------------------------------------------------------
+# 3) Label‑encode IDs using your saved encoders
+# -----------------------------------------------------------------------------
+player_le   = joblib.load("player_encoder.pkl")
+team_le     = joblib.load("team_encoder.pkl")
+opponent_le = joblib.load("opponent_encoder.pkl")
 
-# Save encoders
-joblib.dump(player_le, 'player_encoder.pkl')
-joblib.dump(team_le, 'team_encoder.pkl')
-joblib.dump(opponent_le, 'opponent_encoder.pkl')
+gamelogs['player_id']   = player_le.transform(gamelogs['athlete_display_name'])
+gamelogs['team_id']     = team_le.transform(gamelogs['team_abbreviation'])
+gamelogs['opponent_id'] = opponent_le.transform(gamelogs['opponent_team_abbreviation'])
 
 # ---------------------------------------------------
 # Feature Selection
@@ -162,68 +146,43 @@ features = (
 
 gamelogs.dropna(subset=features + targets, inplace=True)
 
-# ---------------------------------------------------
-# XGBoost Prob Bins
-# ---------------------------------------------------
+# -----------------------------------------------------------------------------
+# 5) Build X_full exactly as in training
+# -----------------------------------------------------------------------------
+X_raw     = gamelogs[features].copy()
+X_num     = X_raw.select_dtypes(include=[np.number])
+X_cat     = X_raw.select_dtypes(include=['object','category'])
+X_encoded = pd.get_dummies(X_cat)            # same one‐hot logic
+X_full    = pd.concat([X_num, X_encoded],axis=1)
+
+# If your training set had columns that don’t appear here (or vice versa),
+# make sure you reindex to the *trained* column set:
+# trained_cols = joblib.load("trained_feature_columns.pkl")
+# X_full = X_full.reindex(columns=trained_cols, fill_value=0)
+
+# -----------------------------------------------------------------------------
+# 6) Load each bin‐model JSON, predict_proba, and append probs
+# -----------------------------------------------------------------------------
 manual_bins = {
-    'points':        [0, 5, 10, 15, 20, 25, 30, 40, 60],
-    'assists':       [0, 2, 4, 6, 8, 10, 15],
-    'rebounds':      [0, 3, 6, 9, 12, 15, 20],
-    'steals':        [0, 1, 2, 3, 4, 5],
-    'blocks':        [0, 1, 2, 3, 4, 5],
-    'three_point_field_goals_made': [0, 1, 2, 3, 4, 6, 8]
+    'points':        [0,5,10,15,20,25,30,40,60],
+    'assists':       [0,2,4,6,8,10,15],
+    'rebounds':      [0,3,6,9,12,15,20],
+    'steals':        [0,1,2,3,4,5],
+    'blocks':        [0,1,2,3,4,5],
+    'three_point_field_goals_made':[0,1,2,3,4,6,8]
 }
 
-def make_manual_bins(df, manual_bins):
-    for target, bins in manual_bins.items():
-        if bins[-1] != float('inf'):
-            bins = bins + [float('inf')]
-        df[f'{target}_bin'] = pd.cut(
-            df[target], bins=bins, labels=False, include_lowest=True
-        )
-    return df
+for target in manual_bins:
+    mdl = xgb.XGBClassifier()
+    # direct filename—no path needed
+    mdl.load_model(f"bin_model_{target}_bin.json")
+    probs = mdl.predict_proba(X_full)  # shape = (n_rows, n_bins)
+    for i in range(probs.shape[1]):
+        gamelogs[f"{target}_prob_{i}"] = probs[:,i]
 
-gamelogs = make_manual_bins(gamelogs, manual_bins)
-bin_target_cols = [f'{t}_bin' for t in targets]
-
-# prepare classification dataset
-X_classify = gamelogs[features].copy()
-X_classify_encoded = pd.get_dummies(X_classify.select_dtypes(include=['object', 'category']))
-X_classify_numeric = X_classify.select_dtypes(include=[np.number])
-X_full = pd.concat([X_classify_numeric, X_classify_encoded], axis=1)
-y_classify = gamelogs[bin_target_cols]
-
-models = {}
-for target in y_classify.columns:
-    clf = xgb.XGBClassifier(
-        objective='multi:softprob', eval_metric='mlogloss',
-        use_label_encoder=False, n_estimators=500, early_stopping_rounds=20,
-        learning_rate=0.05, max_depth=6, subsample=0.8,
-        colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=2.0,
-        tree_method='hist', random_state=SEED, n_jobs=6
-    )
-    clf.fit(X_full, y_classify[target], eval_set=[(X_full, y_classify[target])], verbose=True)
-    models[target] = clf
-
-# ---------------------------------------------------
-# Predict Probabilities & Add to Gamelogs
-# ---------------------------------------------------
-probability_features = []
-for target in y_classify.columns:
-    prob_array = models[target].predict_proba(X_full)
-    for i in range(prob_array.shape[1]):
-        col_name = f"{target.replace('_bin','')}_prob_{i}"
-        gamelogs[col_name] = prob_array[:, i]
-        features.append(col_name)
-        probability_features.append(col_name)
-
-# drop bin columns and any remaining NaNs
-gamelogs.drop(columns=bin_target_cols, inplace=True)
-gamelogs.dropna(inplace=True)
-
-# ---------------------------------------------------
-# ▶▶ NEW BLOCK — define feature groups & load artifacts
-# ---------------------------------------------------
+# -----------------------------------------------------------------------------
+# 7) Features
+# -----------------------------------------------------------------------------
 embedding_features = ['player_id','team_id','opponent_id']
 
 categorical_features = [
@@ -235,7 +194,7 @@ categorical_features = [
     'team_winner_lag4','team_winner_lag5'
 ]
 
-numeric_features = [c for c in features if c not in categorical_features + embedding_features]
+numeric_features = [c for c in gamelogs.columns.tolist() if c not in categorical_features + embedding_features]
 
 add_safe_globals([NBAStatPredictor])
 model        = torch.load("nba_model_full.pt", weights_only=False)   # ← loaded once
@@ -338,10 +297,10 @@ pred_df = pred_df.merge(
     how='left'
 )
 
-pred_df.to_csv("nba_predictions.csv", index=False)
-print("Predictions saved to nba_predictions.csv")
+pred_df.drop(columns=['id', 'full_name', 'first_name', 'last_name', 'is_active'])
 
+pred_df.to_parquet("nba_predictions.parquet", index=False)
+print("Predictions saved to nba_predictions.parquet")
 
-import sys, os
 print("Python exe :", sys.executable)
 print("Conda env  :", os.getenv("CONDA_DEFAULT_ENV"))

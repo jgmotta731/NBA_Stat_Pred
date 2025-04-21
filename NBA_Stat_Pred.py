@@ -202,7 +202,7 @@ for target in y_classify.columns:
         use_label_encoder=False, n_estimators=500, early_stopping_rounds=20,
         learning_rate=0.05, max_depth=6, subsample=0.8,
         colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=2.0,
-        tree_method='hist', random_state=SEED, n_jobs=6
+        tree_method='hist', random_state=SEED, n_jobs=10
     )
     clf.fit(X_full, y_classify[target], eval_set=[(X_full, y_classify[target])], verbose=True)
     models[target] = clf
@@ -316,7 +316,7 @@ class NBAGameDataset(Dataset):
 
 train_loader = DataLoader(
     NBAGameDataset(X_train, y_train, player_ids_train, team_ids_train, opp_ids_train),
-    batch_size=128, shuffle=True
+    batch_size=128, shuffle=False
 )
 val_loader = DataLoader(
     NBAGameDataset(X_val, y_val, player_ids_val, team_ids_val, opp_ids_val),

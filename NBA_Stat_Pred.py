@@ -1,5 +1,5 @@
 """
-Created on Sun Apr 20 21:23:04 2025
+Created on Sun Apr 20 2025
 
 @author: jgmot
 """
@@ -22,8 +22,6 @@ from sklearn.metrics import root_mean_squared_error, r2_score
 import xgboost as xgb
 import warnings
 import json
-from nba_api.stats.static import players
-from datetime import date, timedelta
 
 warnings.filterwarnings("ignore")
 
@@ -456,104 +454,6 @@ def evaluate_to_parquet(model, val_loader, target_names, output_path="evaluation
 
 metrics_df = evaluate_to_parquet(model, val_loader, targets)
 print(metrics_df)
-
-# ---------------------------------------------------
-# Predict Next Games (Only 2025 starters)
-# ---------------------------------------------------
-latest_players = (
-    gamelogs[gamelogs['season'] == 2025]
-    .sort_values('game_date')
-    .groupby('athlete_display_name')
-    .tail(1)
-)
-latest_players = latest_players[latest_players['starter_lag1'] == True].copy()
-
-schedule = pd.read_parquet("nba_schedule.parquet")
-schedule_clean = schedule[
-    (schedule['home_abbreviation'] != 'TBD') &
-    (schedule['away_abbreviation'] != 'TBD')
-].copy()
-
-schedule_clean['home_away'] = 'home'
-schedule_away = schedule_clean.copy()
-schedule_away['home_away'] = 'away'
-schedule_away[['home_abbreviation','away_abbreviation']] = \
-    schedule_away[['away_abbreviation','home_abbreviation']]
-schedule_expanded = pd.concat([schedule_clean, schedule_away], ignore_index=True)
-schedule_expanded.rename(columns={
-    'home_abbreviation': 'team_abbreviation',
-    'away_abbreviation': 'opponent_team_abbreviation'
-}, inplace=True)
-
-schedule_players = schedule_expanded.merge(
-    latest_players,
-    on='team_abbreviation',
-    how='left',
-    suffixes=('','_player')
-)
-schedule_players.drop(columns=[
-    'game_date_player','home_away_player','opponent_team_abbreviation_player'
-], errors='ignore', inplace=True)
-schedule_players.dropna(subset=features, inplace=True)
-
-# --- ensure the schedule dates are proper datetimes ---
-schedule_players['game_date'] = pd.to_datetime(
-    schedule_players['game_date'], errors='coerce'
-)
-
-# build model inputs
-X_pred          = preprocessor.transform(
-    schedule_players[numeric_features + categorical_features]
-)
-player_ids_pred = schedule_players['player_id'].values
-team_ids_pred   = schedule_players['team_id'].values
-opp_ids_pred    = schedule_players['opponent_id'].values
-
-# make predictions
-with torch.no_grad():
-    preds = model(
-        torch.tensor(X_pred, dtype=torch.float32),
-        torch.tensor(player_ids_pred, dtype=torch.long),
-        torch.tensor(team_ids_pred, dtype=torch.long),
-        torch.tensor(opp_ids_pred, dtype=torch.long)
-    )
-    preds = torch.expm1(preds).numpy()
-
-# assemble results
-pred_df = schedule_players[[
-    'athlete_display_name','athlete_position_abbreviation',
-    'team_abbreviation','opponent_team_abbreviation',
-    'game_date','home_away'
-]].copy()
-
-for i, col in enumerate(targets):
-    pred_df[f'predicted_{col}'] = preds[:, i].round(1)
-
-# --- filter to current week using Timestamps ---
-today = date.today()
-start_of_week = pd.to_datetime(today - timedelta(days=today.weekday()))
-end_of_week   = start_of_week + timedelta(days=6)
-
-pred_df = pred_df[
-    (pred_df['game_date'] >= start_of_week) &
-    (pred_df['game_date'] <= end_of_week)
-]
-pred_df['game_date'] = pred_df['game_date'].dt.strftime('%Y-%m-%d')
-
-# add headshots & save
-player_df = pd.DataFrame(players.get_active_players())
-player_df['headshot_url'] = player_df['id'].apply(
-    lambda pid: f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
-)
-pred_df = pred_df.merge(
-    player_df,
-    left_on='athlete_display_name',
-    right_on='full_name',
-    how='left'
-)
-
-pred_df.to_csv("nba_predictions.csv", index=False)
-print("Predictions saved to nba_predictions.csv")
 
 # ---------------------------------------------------
 # 1. Save Preprocessor

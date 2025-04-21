@@ -18,6 +18,9 @@ A full pipeline to predict NBA player stats for upcoming games using PyTorch and
 
 ```
 nba-stat-predictor/
+├── www/
+│   ├── nba_dark.png
+│   ├── nba_light.png
 ├── app.R
 ├── update_nba_data.R
 ├── NBA_Stat_Pred.py

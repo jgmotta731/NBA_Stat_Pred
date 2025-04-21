@@ -69,6 +69,8 @@ A companion **Shiny dashboard** built in R provides a user-friendly interface to
 - Includes headshots and sortable stat columns
 - View model performance metrics with brief explanation on how to interpret them.
 
+Link: [https://jmotta31.shinyapps.io/NBA_Prediction_Tool/](https://jmotta31.shinyapps.io/NBA_Prediction_Tool/)
+
 Use this dashboard to gather insights with player prop bets and fantasy players.
 
 ---

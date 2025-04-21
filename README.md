@@ -67,6 +67,8 @@ A companion **Shiny dashboard** built in R provides a user-friendly interface to
 - Filter by player, team, or position
 - View predictions by matchup and date
 - Includes headshots and sortable stat columns
+- Implied probability calculator using American odds.
+  - Use betting sites odds and input them in the calcuator for implied probability.
 - View model performance metrics with brief explanation on how to interpret them.
 
 Link: [https://jmotta31.shinyapps.io/NBA_Prediction_Tool/](https://jmotta31.shinyapps.io/NBA_Prediction_Tool/)

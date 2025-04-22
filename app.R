@@ -11,8 +11,6 @@ library(stringr)
 # ---------------------------------------------------
 # Load Data
 # ---------------------------------------------------
-nba_preds  <- read_parquet("nba_predictions.parquet") %>%
-  mutate(home_away = str_to_title(home_away))
 metrics_df <- read_parquet("evaluation_metrics.parquet")
 
 # ---------------------------------------------------
@@ -160,6 +158,13 @@ ui <- tagList(
 # Server
 # ---------------------------------------------------
 server <- function(input, output, session) {
+  # --- reactive reader for the parquet file, now every 12 hours ---
+  preds_df <- reactiveFileReader(
+    intervalMillis = 12 * 60 * 60 * 1000,  # 12 hours = 12 × 60 min × 60 s × 1000 ms
+    session        = session,
+    filePath       = "nba_predictions.parquet",
+    readFunc       = arrow::read_parquet
+  )
   
   output$implied_prob <- renderText({
     req(input$american_odds)
@@ -170,7 +175,7 @@ server <- function(input, output, session) {
   })
   
   output$predictions_table <- renderReactable({
-    df <- nba_preds %>%
+    df <- preds_df() %>%
       mutate(across(starts_with("predicted_"), ~ round(.x,1))) %>%
       mutate(
         Player = paste0(

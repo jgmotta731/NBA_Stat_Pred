@@ -13,6 +13,7 @@ import pandas as pd
 import xgboost as xgb
 import torch
 from nba_api.stats.static import players
+from unidecode import unidecode
 from nba_model import NBAStatPredictor
 from torch.serialization import add_safe_globals
 
@@ -290,14 +291,19 @@ player_df = pd.DataFrame(players.get_active_players())
 player_df['headshot_url'] = player_df['id'].apply(
     lambda pid: f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
 )
+
+player_df['full_name'] = player_df['full_name'].apply(lambda name: unidecode(name).title())
+pred_df['normalized_name'] = pred_df['athlete_display_name'].apply(lambda name: unidecode(name).title())
+
 pred_df = pred_df.merge(
     player_df,
-    left_on='athlete_display_name',
+    left_on='normalized_name',
     right_on='full_name',
     how='left'
 )
 
-pred_df.drop(columns=['id', 'full_name', 'first_name', 'last_name', 'is_active'])
+pred_df.drop(columns=['id', 'full_name', 'first_name', 'last_name', 'is_active', 'normalized_name'], inplace=True)
+pred_df['home_away'] = pred_df['home_away'].str.capitalize()
 
 pred_df.to_parquet("nba_predictions.parquet", index=False)
 print("Predictions saved to nba_predictions.parquet")

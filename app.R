@@ -202,6 +202,7 @@ server <- function(input, output, session) {
       df,
       searchable      = TRUE,
       defaultPageSize = 7,
+      defaultSorted   = "Date",
       highlight       = TRUE,
       compact         = TRUE,
       columns = list(

@@ -317,10 +317,10 @@ try:
     player_df['headshot_url'] = player_df['id'].apply(
         lambda pid: f"https://cdn.nba.com/headshots/nba/latest/1040x760/{pid}.png"
     )
-    player_df['full_name'] = player_df['full_name'].apply(lambda name: unidecode(name).title())
+    player_df['normalized_name'] = player_df['full_name'].apply(lambda name: unidecode(name).title())
     pred_df['normalized_name'] = pred_df['athlete_display_name'].apply(lambda name: unidecode(name).title())
-    pred_df = pred_df.merge(player_df, left_on='normalized_name', right_on='full_name', how='left')
-    pred_df.drop(columns=['id', 'full_name', 'first_name', 'last_name', 'is_active', 'normalized_name'], inplace=True)
+    pred_df = pred_df.merge(player_df, left_on='normalized_name', right_on='normalized_name', how='left')
+    pred_df = pred_df.drop(columns=['id', 'full_name', 'first_name', 'last_name', 'is_active', 'normalized_name', 'normalized_name'])
 except Exception as e:
     print("Warning: could not fetch player headshots:", e)
 
@@ -328,23 +328,20 @@ except Exception as e:
 pred_df[pred_cols] = pred_df[pred_cols].clip(lower=0)
 
 # Remove all punctuation (including periods) from athlete_display_name
-pred_df['athlete_display_name'] = pred_df['athlete_display_name'].str.replace(r'[^\w\s]', '', regex=True)
+pred_df['normalized_name'] = pred_df['athlete_display_name'].str.replace(r'[^\w\s]', '', regex=True)
 betting_odds = pd.read_csv('Pivoted_Betting_Odds.csv')
 betting_odds['player_name'] = betting_odds['player_name'].str.replace(r'[^\w\s]', '', regex=True)
-
-# Only keep player_name column
-betting_odds = betting_odds[['player_name']].copy()
 
 # Inner join ➜ keep only players in both prediction and betting data
 pred_df = pred_df.merge(
     betting_odds,
-    left_on='athlete_display_name',
+    left_on='normalized_name',
     right_on='player_name',
     how='inner'
 )
 
 
-pred_df = pred_df.drop(columns='player_name')
+pred_df = pred_df.drop(columns=['player_name', 'normalized_name'])
 
 # Save
 pred_df.to_parquet("nba_predictions.parquet", index=False)

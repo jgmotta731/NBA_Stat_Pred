@@ -330,7 +330,7 @@ server <- function(input, output, session) {
     reactable(
       df_to_display,
       searchable      = TRUE,
-      defaultPageSize = 12,
+      pagination = FALSE,
       filterable = TRUE,
       highlight       = TRUE,
       compact         = TRUE,

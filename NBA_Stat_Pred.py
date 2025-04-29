@@ -1,42 +1,44 @@
 """
 Created on Sun Apr 20 2025
 
-@author: jgmot
+@author: Jack Motta
 """
 
 # ---------------------------------------------------
 # Imports & Seed Setup
 # ---------------------------------------------------
-import os, random, joblib
+
+import os, random, joblib, gc, warnings
+from joblib import dump
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
-from sklearn.metrics import root_mean_squared_error, r2_score
-import xgboost as xgb
-import warnings
-import json
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.metrics import root_mean_squared_error, r2_score, precision_score, f1_score, recall_score, accuracy_score, silhouette_score, mean_absolute_error
+from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
+from sklearn.cluster import KMeans
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.linear_model import MultiTaskLasso
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+import seaborn as sns
+import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.io as pio
 
 warnings.filterwarnings("ignore")
-
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
 os.environ['PYTHONHASHSEED'] = str(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+pd.set_option('display.max_columns', 10)
 
 # ---------------------------------------------------
 # Load & Prepare Data
 # ---------------------------------------------------
+
 gamelogs = pd.read_parquet('nba_gamelogs.parquet')
 # downcast numeric types
 gamelogs[gamelogs.select_dtypes('float64').columns] = \
@@ -45,442 +47,676 @@ gamelogs[gamelogs.select_dtypes('float64').columns] = \
 gamelogs[gamelogs.select_dtypes('int64').columns] = \
     gamelogs.select_dtypes('int64')\
             .apply(pd.to_numeric, downcast='integer')
-gamelogs = gamelogs[gamelogs['did_not_play'] == False].copy()
+        
+# Only keep 2022 season onwards
+gamelogs = gamelogs[gamelogs["season"] >= 2022].copy()
+
+# Response variables
+targets = ['three_point_field_goals_made', 'rebounds', 'assists', 'steals', 'blocks', 'points']
+
+# Drop games with missing target stats (i.e., not played)
+gamelogs = gamelogs.dropna(subset=targets).copy()
+
+# Count games per player
+player_game_counts = gamelogs.groupby("athlete_display_name").size()
+
+# Keep only players with >=10 valid games
+valid_players = player_game_counts[player_game_counts >= 10].index
+gamelogs = gamelogs[gamelogs["athlete_display_name"].isin(valid_players)].copy()
+
+# After filtering players ➔ filter low-minute games
+gamelogs = gamelogs[gamelogs["minutes"] >= 20].reset_index(drop=True)
+
+# Clean up
+del valid_players, player_game_counts
+gc.collect()
 
 # ---------------------------------------------------
 # Feature Engineering
 # ---------------------------------------------------
+
+# Convert booleans to numeric
+for col in ['starter', 'ejected', 'team_winner', 'is_playoff']:
+    if col in gamelogs.columns:
+        gamelogs[col] = gamelogs[col].fillna(False).astype(np.int32)
+
 rolling_cols = [
     'field_goals_made', 'field_goals_attempted', 'three_point_field_goals_made',
     'three_point_field_goals_attempted', 'free_throws_made', 'free_throws_attempted',
     'offensive_rebounds', 'defensive_rebounds', 'rebounds', 'assists', 'steals', 'blocks',
     'turnovers', 'fouls', 'points', 'minutes'
 ]
-targets = ['three_point_field_goals_made', 'rebounds', 'assists', 'steals', 'blocks', 'points']
 
-gamelogs.dropna(subset=rolling_cols + targets, inplace=True)
-gamelogs.sort_values(by=['season', 'game_date', 'team_abbreviation', 'athlete_display_name'], inplace=True)
+gamelogs = gamelogs.sort_values(by=['season', 'game_date', 'team_abbreviation', 'athlete_display_name'])
 
-gamelogs['is_playoff'] = gamelogs['season_type'].isin([3, 5]).astype(int)
+gamelogs['is_playoff'] = gamelogs['season_type'].isin([3, 5]).astype(np.int32)
 gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'])
-gamelogs['days_since_last_game'] = gamelogs.groupby('athlete_display_name')['game_date'].diff().dt.days
+gamelogs['days_since_last_game'] = gamelogs.groupby('athlete_display_name')['game_date'].diff().dt.days.astype(np.float32)
 
-# Rolling averages: 3, 5, 10 games back, shifted
-for window in [3, 5, 10]:
+# Rolling Metrics: 10, shifted
+for window in [10]:
     for col in rolling_cols:
+        # Rolling Averages
         gamelogs[f'{col}_rolling{window}'] = (
             gamelogs.groupby('athlete_display_name')[col]
-                    .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-        )
+            .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+        ).astype(np.float32)
 
-# Lag team winner: 1 to 6 games back
-for lag in range(1, 6):
-    gamelogs[f'team_winner_lag{lag}'] = gamelogs.groupby('athlete_display_name')['team_winner'].shift(lag)
+        # Momentum
+        gamelogs[f'{col}_momentum{window}'] = (
+            gamelogs.groupby('athlete_display_name')[col]
+            .transform(lambda x: x.shift(1)) - 
+            gamelogs.groupby('athlete_display_name')[col]
+            .transform(lambda x: x.shift(2).rolling(window, min_periods=1).mean())
+        ).astype(np.float32)
 
-# Lag binary categorical columns: 1 to 3 games back
-for col in ['is_playoff', 'ejected', 'starter']:
-    for lag in range(1, 4):
-        gamelogs[f'{col}_lag{lag}'] = gamelogs.groupby('athlete_display_name')[col].shift(lag)
+        # Global rolling rank
+        gamelogs[f'{col}_global_rolling_rank{window}'] = (
+            gamelogs.groupby('game_date')[f'{col}_rolling{window}']
+            .rank(method="average", pct=True)
+        ).astype(np.float32)
 
-# Opponent rolling defense metrics
-for w in [3, 5, 10]:
-    # Rolling averages of the opponent’s own score
-    gamelogs[f"opponent_team_score_rolling{w}"] = (
-        gamelogs
-          .groupby("opponent_team_abbreviation")["opponent_team_score"]
-          .transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
-    )
+    # Efficiency ratios
+    gamelogs[f'assist_to_turnover_rolling{window}'] = (
+        gamelogs[f'assists_rolling{window}'] / (gamelogs[f'turnovers_rolling{window}'] + 1)
+    ).astype(np.float32)
 
-    # Rolling averages of points the opponent allowed
-    gamelogs[f"opponent_points_allowed_{w}"] = (
-        gamelogs
-          .groupby("opponent_team_abbreviation")["team_score"]
-          .transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
-    )
+    gamelogs[f'orb_pct_rolling{window}'] = (
+        gamelogs[f'offensive_rebounds_rolling{window}'] / gamelogs[f'rebounds_rolling{window}']
+    ).astype(np.float32)
 
-    # Rank the opponent’s defence within the season for this window
-    gamelogs[f"opponent_defense_rank_{w}"] = (
-        gamelogs
-          .groupby("season")[f"opponent_points_allowed_{w}"]
-          .rank(method="average", pct=True)     # lower points‑allowed ⟹ lower (better) percentile
-    )
+    gamelogs[f'fg_pct_rolling{window}'] = (
+        gamelogs[f'field_goals_made_rolling{window}'] / gamelogs[f'field_goals_attempted_rolling{window}']
+    ).astype(np.float32)
 
-# Choose one window (10‑game here) as the “main” defence‑rank column
-gamelogs["opponent_defense_rank"] = gamelogs["opponent_defense_rank_10"]
+    gamelogs[f'ft_pct_rolling{window}'] = (
+        gamelogs[f'free_throws_made_rolling{window}'] / gamelogs[f'free_throws_attempted_rolling{window}']
+    ).astype(np.float32)
 
-# ---------------------------------------------------
-# Label Encoding
-# ---------------------------------------------------
-player_le = LabelEncoder()
-team_le = LabelEncoder()
-opponent_le = LabelEncoder()
-gamelogs['player_id']   = player_le.fit_transform(gamelogs['athlete_display_name'])
-gamelogs['team_id']     = team_le.fit_transform(gamelogs['team_abbreviation'])
-gamelogs['opponent_id'] = opponent_le.fit_transform(gamelogs['opponent_team_abbreviation'])
+for window in [10]:
+    # Opponent Defense
+    gamelogs[f"opponent_team_score_rolling{window}"] = (
+        gamelogs.groupby("opponent_team_abbreviation")["opponent_team_score"]
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    ).astype(np.float32)
 
-# Save encoders
-joblib.dump(player_le, 'player_encoder.pkl')
-joblib.dump(team_le, 'team_encoder.pkl')
-joblib.dump(opponent_le, 'opponent_encoder.pkl')
+    gamelogs[f"opponent_points_allowed_rolling{window}"] = (
+        gamelogs.groupby("opponent_team_abbreviation")["team_score"]
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    ).astype(np.float32)
+
+    gamelogs[f"opponent_defense_rank_rolling{window}"] = (
+        gamelogs.groupby("season")[f"opponent_points_allowed_rolling{window}"]
+        .rank(method="average", pct=True)
+    ).astype(np.float32)
+
+    # Team Offense
+    gamelogs[f"team_score_rolling{window}"] = (
+        gamelogs.groupby("team_abbreviation")["team_score"]
+        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
+    ).astype(np.float32)
+
+    gamelogs[f"team_offense_rank_rolling{window}"] = (
+        gamelogs.groupby("season")[f"team_score_rolling{window}"]
+        .rank(method="average", pct=True)
+    ).astype(np.float32)
+
+# Rolling Win Streak
+gamelogs['rolling_win_streak'] = (
+    gamelogs.sort_values(['athlete_display_name', 'game_date'])
+    .groupby('athlete_display_name')['team_winner']
+    .transform(lambda x: x.shift(1).groupby((x.shift(1) != 1).cumsum()).cumcount())
+).astype(np.int32)
+
+# Rolling Loss Streak
+gamelogs['rolling_loss_streak'] = (
+    gamelogs.sort_values(['athlete_display_name', 'game_date'])
+    .groupby('athlete_display_name')['team_winner']
+    .transform(lambda x: x.shift(1).groupby((x.shift(1) != 0).cumsum()).cumcount())
+).astype(np.int32)
+
+# Safe division (clip small denominators)
+def safe_divide(numerator, denominator, eps=1e-3):
+    return numerator / (denominator + eps)
+
+gamelogs[f'fg_pct_rolling{window}'] = safe_divide(
+    gamelogs[f'field_goals_made_rolling{window}'],
+    gamelogs[f'field_goals_attempted_rolling{window}']
+).clip(0, 1).astype(np.float32)
 
 # ---------------------------------------------------
 # Feature Selection
 # ---------------------------------------------------
-gamelogs.drop(columns=[
+
+gamelogs = gamelogs.drop(columns=[
     'minutes', 'plus_minus', 'field_goals_made', 'field_goals_attempted',
     'three_point_field_goals_attempted', 'turnovers', 'fouls',
-    'free_throws_attempted', 'free_throws_made', 'starter', 'ejected',
+    'free_throws_attempted', 'free_throws_made', 'ejected',
     'did_not_play', 'team_winner', 'team_score', 'opponent_team_score', 'active',
-    'season_type'
-], inplace=True)
+    'season_type', 'starter'
+    ])
 
 available_cols = set(gamelogs.columns)
-lagged_rolling_features = [
-    f'{col}_lag{i}'
-    for col in rolling_cols for i in [1, 2, 3]
-    if f'{col}_lag{i}' in available_cols
-]
 
-features = (
-    ['home_away', 'athlete_position_abbreviation']
-    # player‑centric rolling means
-    + [f'{col}_rolling{w}' for col in rolling_cols for w in [3, 5, 10]]
-    # binary‑flag lags
-    + [f'{col}_lag{i}' for col in ['ejected', 'starter', 'is_playoff'] for i in [1, 2, 3]]
-    # numeric stat lags that already exist
-    + lagged_rolling_features
-    # team‑winner lags
-    + [f'team_winner_lag{i}' for i in range(1, 6)]
-    # opponent‑defence windows (3, 5, 10)
-    + [f'opponent_team_score_rolling{w}'   for w in [3, 5, 10]]
-    + [f'opponent_points_allowed_{w}'      for w in [3, 5, 10]]
-    + [f'opponent_defense_rank_{w}'        for w in [3, 5, 10]]
-    # keep the plain alias column for whichever window you chose (10‑game in our example)
-    + ['opponent_defense_rank']
-    # remaining contextual / ID features
-    + ['is_playoff', 'days_since_last_game',
-       'player_id', 'team_id', 'opponent_id']
-)
+lagged_rolling_features = [col for col in gamelogs.columns
+                           if 'rolling' in col or 'lag' in col]
 
-gamelogs.dropna(subset=features + targets, inplace=True)
+numeric_features = lagged_rolling_features + ['days_since_last_game']
+categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff"]
+features = numeric_features + categorical_features
+
+# Ensure uniqueness in lists
+numeric_features = list(dict.fromkeys(numeric_features))
+categorical_features = list(dict.fromkeys(categorical_features))
+features = list(dict.fromkeys(features))
+
+# Add missing flag
+def add_generic_missing_flag(X_df, feature_list):
+    X_df = X_df.copy()
+    X_df['was_missing'] = X_df[feature_list].isna().any(axis=1).astype(int)
+    return X_df
+
+gamelogs = add_generic_missing_flag(gamelogs, features)
+
+# Final recomputed feature groups
+features = numeric_features + ['was_missing'] + categorical_features
+
+# Enforce uniqueness
+features = list(dict.fromkeys(features))
+numeric_features = list(dict.fromkeys(numeric_features))
+categorical_features = list(dict.fromkeys(categorical_features))
 
 # ---------------------------------------------------
-# XGBoost Prob Bins
+# EDA
 # ---------------------------------------------------
-manual_bins = {
-    'points':        [0, 5, 10, 15, 20, 25, 30, 40, 60],
-    'assists':       [0, 2, 4, 6, 8, 10, 15],
-    'rebounds':      [0, 3, 6, 9, 12, 15, 20],
-    'steals':        [0, 1, 2, 3, 4, 5],
-    'blocks':        [0, 1, 2, 3, 4, 5],
-    'three_point_field_goals_made': [0, 1, 2, 3, 4, 6, 8]
+
+# Aggregate stats by player (take the mean of numeric features)
+player_summary = gamelogs.groupby('athlete_display_name')[numeric_features].mean().reset_index()
+
+# Calculate per-player averages for targets
+for target in ['points', 'assists', 'rebounds', 'steals', 'blocks', 'three_point_field_goals_made']:
+    player_summary[f'avg_{target}'] = gamelogs.groupby('athlete_display_name')[target].mean().values
+
+# Define bin edges
+bin_edges = {
+    'points': [0, 10, 15, 20, 25, 30, np.inf],
+    'assists': [0, 2, 4, 6, 8, np.inf],
+    'rebounds': [0, 4, 6, 8, 10, 12, np.inf],
+    'steals': [0, 1, 2, np.inf],
+    'blocks': [0, 1, 2, np.inf],
+    'three_point_field_goals_made': [0, 1, 2, 3, 4, np.inf]
 }
 
-def make_manual_bins(df, manual_bins):
-    for target, bins in manual_bins.items():
-        if bins[-1] != float('inf'):
-            bins = bins + [float('inf')]
-        df[f'{target}_bin'] = pd.cut(
-            df[target], bins=bins, labels=False, include_lowest=True
-        )
-    return df
-
-gamelogs = make_manual_bins(gamelogs, manual_bins)
-bin_target_cols = [f'{t}_bin' for t in targets]
-
-# prepare classification dataset
-X_classify = gamelogs[features].copy()
-X_classify_encoded = pd.get_dummies(X_classify.select_dtypes(include=['object', 'category']))
-X_classify_numeric = X_classify.select_dtypes(include=[np.number])
-X_full = pd.concat([X_classify_numeric, X_classify_encoded], axis=1)
-y_classify = gamelogs[bin_target_cols]
-
-models = {}
-for target in y_classify.columns:
-    clf = xgb.XGBClassifier(
-        objective='multi:softprob', eval_metric='mlogloss',
-        use_label_encoder=False, n_estimators=500, early_stopping_rounds=20,
-        learning_rate=0.05, max_depth=6, subsample=0.8,
-        colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=2.0,
-        tree_method='hist', random_state=SEED, n_jobs=10
+# Bin them
+for target, edges in bin_edges.items():
+    player_summary[f'{target}_bin'] = pd.cut(
+        player_summary[f'avg_{target}'],
+        bins=edges,
+        labels=[f'{edges[i]}-{edges[i+1]}' if edges[i+1] != np.inf else f'{edges[i]}+' for i in range(len(edges)-1)],
+        right=False
     )
-    clf.fit(X_full, y_classify[target], eval_set=[(X_full, y_classify[target])], verbose=True)
-    models[target] = clf
 
-# ---------------------------------------------------
-# Predict Probabilities & Add to Gamelogs
-# ---------------------------------------------------
-probability_features = []
-for target in y_classify.columns:
-    prob_array = models[target].predict_proba(X_full)
-    for i in range(prob_array.shape[1]):
-        col_name = f"{target.replace('_bin','')}_prob_{i}"
-        gamelogs[col_name] = prob_array[:, i]
-        features.append(col_name)
-        probability_features.append(col_name)
+player_summary = player_summary.drop(columns=[f'avg_{target}' for target in 
+                                              ['points', 'assists', 'rebounds', 
+                                               'steals', 'blocks', 
+                                               'three_point_field_goals_made']])
 
-# drop bin columns and any remaining NaNs
-gamelogs.drop(columns=bin_target_cols, inplace=True)
-gamelogs.dropna(inplace=True)
-gamelogs.to_parquet("nba_gamelogs_processed.parquet", index=False)
+# Use PCA for visualizations
+eda_preprocessor = ColumnTransformer([
+    ('num', Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+        ]), numeric_features)
+    ])
 
-# ---------------------------------------------------
-# Train/Validation Split + Recency Weights
-# ---------------------------------------------------
-train_df = gamelogs[gamelogs['season'] < 2025].copy()
-val_df   = gamelogs[gamelogs['season'] >= 2025].copy()
-
-train_df['recency_weight'] = (
-    (train_df['game_date'] - train_df['game_date'].min()).dt.days + 1
-)
-train_df['recency_weight'] /= train_df['recency_weight'].max()
-
-# ---------------------------------------------------
-# Define Feature Groups
-# ---------------------------------------------------
-embedding_features   = ['player_id', 'team_id', 'opponent_id']
-categorical_features = [
-    'home_away', 'athlete_position_abbreviation', 'is_playoff',
-    'ejected_lag1','starter_lag1','is_playoff_lag1',
-    'ejected_lag2','starter_lag2','is_playoff_lag2',
-    'ejected_lag3','starter_lag3','is_playoff_lag3',
-    'team_winner_lag1','team_winner_lag2','team_winner_lag3',
-    'team_winner_lag4','team_winner_lag5'
-]
-numeric_features = [
-    f for f in features
-    if f not in categorical_features + embedding_features
-]
-# ensure probability_features are included
-for col in probability_features:
-    if col not in numeric_features:
-        numeric_features.append(col)
-
-# ---------------------------------------------------
-# Preprocessor (with imputation & ignore‐unknown)
-# ---------------------------------------------------
-# enforce training‐time dtypes
-string_cats = ['home_away', 'athlete_position_abbreviation']
-flag_cats   = [c for c in categorical_features if c not in string_cats]
-
-# cast string cats
-for col in string_cats:
-    train_df[col] = train_df[col].astype(str)
-# cast flag cats
-for col in flag_cats:
-    train_df[col] = pd.to_numeric(train_df[col], errors='coerce').fillna(0).astype(int)
-# cast numeric
-for col in numeric_features:
-    train_df[col] = pd.to_numeric(train_df[col], errors='coerce')
-
-num_pipe = Pipeline([
-    ('imputer', SimpleImputer(strategy='median')),
-    ('scaler',  StandardScaler())
+eda_pipeline = Pipeline([
+    ('pre', eda_preprocessor),
+    ('pca', PCA(n_components=2, random_state=SEED))
 ])
-cat_pipe = Pipeline([
-    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
-    ('ohe',     OneHotEncoder(handle_unknown='ignore', drop='if_binary'))
-])
+
+X_eda = eda_pipeline.fit_transform(player_summary[numeric_features])
+
+pca_df = pd.DataFrame(X_eda, columns=['PC1', 'PC2'])
+for bin_col in ['points_bin', 'rebounds_bin', 'assists_bin', 'steals_bin', 
+                'blocks_bin', 'three_point_field_goals_made_bin']:
+    pca_df[bin_col] = player_summary[bin_col].values
+
+# Plot each bin separately
+bin_names = ['points_bin', 'rebounds_bin', 'assists_bin', 'steals_bin', 
+             'blocks_bin', 'three_point_field_goals_made_bin']
+
+# Plot
+for bin_name in bin_names:
+    plt.figure(figsize=(10, 7))
+    sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue=bin_name, palette='tab10', 
+                    s=50, edgecolor='k')
+    plt.title(f'PCA of Player Summaries Colored by {bin_name.replace("_", " ").title()}', fontsize=16)
+    plt.xlabel('Principal Component 1', fontsize=14); plt.ylabel('Principal Component 2', fontsize=14)
+    plt.legend(title=bin_name.replace("_", " ").title(), fontsize=12, title_fontsize=13)
+    plt.grid(True, linestyle='--', alpha=0.5); plt.tight_layout(); plt.show()
+
+# ---------------------------------------------------
+# PCA + Clustering (with Temporal Train/Test Split)
+# ---------------------------------------------------
+
+# Step 1: Temporal Split
+train_gamelogs = gamelogs[gamelogs['season'] < 2025].copy()
+
+# Step 2: Aggregate to Player Level Separately
+train_player_summary = train_gamelogs.groupby('athlete_display_name')[numeric_features].mean().reset_index()
+
+# Step 3: Preprocessing
 preprocessor = ColumnTransformer([
-    ('num', num_pipe, numeric_features),
-    ('cat', cat_pipe, categorical_features)
+    ('num', Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scaler', StandardScaler())
+    ]), numeric_features)
 ])
 
-X_train = preprocessor.fit_transform(train_df[numeric_features + categorical_features])
-y_train = train_df[targets].values.astype(np.float32)
-X_val   = preprocessor.transform(val_df[numeric_features + categorical_features])
-y_val   = val_df[targets].values.astype(np.float32)
+# Step 4: Fit PCA only on train
+X_train_proc = preprocessor.fit_transform(train_player_summary[numeric_features])
+pca = PCA(random_state=SEED)
+X_train_pca = pca.fit_transform(X_train_proc)
 
-player_ids_train = train_df['player_id'].values
-team_ids_train   = train_df['team_id'].values
-opp_ids_train    = train_df['opponent_id'].values
-player_ids_val   = val_df['player_id'].values
-team_ids_val     = val_df['team_id'].values
-opp_ids_val      = val_df['opponent_id'].values
-train_weights    = train_df['recency_weight'].values.astype(np.float32)
+# Scree plots
+plt.figure(figsize=(10,6))
+plt.plot(np.cumsum(pca.explained_variance_ratio_), marker='o')
+plt.xlabel('Number of Principal Components')
+plt.ylabel('Cumulative Explained Variance')
+plt.title('Explained Variance by PCA Components'); plt.grid(True); plt.show()
+
+plt.figure(figsize=(10,6))
+plt.bar(np.arange(1, len(pca.explained_variance_) + 1), pca.explained_variance_)
+plt.xlabel('Principal Component')
+plt.ylabel('Variance Explained')
+plt.title('Scree Plot'); plt.grid(True); plt.tight_layout(); plt.show()
+
+# Step 5: Fit PCA Pipeline
+pca_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('pca', PCA(n_components=2, random_state=SEED))
+])
+
+X_cluster_train = pca_pipeline.fit_transform(train_player_summary[numeric_features])
+
+# Step 6: Find k clusters on train
+inertias = []
+silhouette_scores = []
+k_values = range(2, 13)
+
+for k in k_values:
+    kmeans = KMeans(n_clusters=k, random_state=SEED)
+    kmeans.fit(X_cluster_train)
+    inertias.append(kmeans.inertia_)
+    silhouette_scores.append(silhouette_score(X_cluster_train, kmeans.labels_))
+
+# Plot
+fig, ax1 = plt.subplots(figsize=(12,5))
+color = 'tab:blue'
+ax1.set_xlabel('Number of clusters (k)')
+ax1.set_ylabel('Inertia (Distortion)', color=color)
+ax1.plot(k_values, inertias, marker='o', color=color)
+ax1.tick_params(axis='y', labelcolor=color); ax1.grid(True)
+
+ax2 = ax1.twinx(); color = 'tab:orange'
+ax2.set_ylabel('Silhouette Score', color=color)
+ax2.plot(k_values, silhouette_scores, marker='s', color=color)
+ax2.tick_params(axis='y', labelcolor=color)
+plt.title('Elbow Method + Silhouette Score'); plt.tight_layout(); plt.show()
+
+# Step 7: Final KMeans
+kmeans_final = KMeans(n_clusters=3, random_state=SEED)
+kmeans_final.fit(X_cluster_train)
+
+# Step 8: Assign clusters
+train_player_summary['cluster_label'] = kmeans_final.labels_ + 1
+
+# Step 9: Visualize clusters
+pca_2d_df = pd.DataFrame(X_cluster_train, columns=['PC1', 'PC2'])
+pca_2d_df['cluster_label'] = train_player_summary['cluster_label'].values
+
+plt.figure(figsize=(10, 7))
+sns.scatterplot(data=pca_2d_df, x='PC1', y='PC2', hue='cluster_label',
+    palette='tab10', s=70, edgecolor='k')
+plt.title('PCA of Player Profiles Colored by Cluster', fontsize=16)
+plt.xlabel('Principal Component 1', fontsize=14)
+plt.ylabel('Principal Component 2', fontsize=14)
+plt.legend(title='Cluster Label', fontsize=12, title_fontsize=13)
+plt.grid(True, linestyle='--', alpha=0.5); plt.tight_layout(); plt.show()
 
 # ---------------------------------------------------
-# Dataset
+# Interactive Scatterplot of Players
 # ---------------------------------------------------
-class NBAGameDataset(Dataset):
-    def __init__(self, X, y, player_ids, team_ids, opponent_ids):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-        self.p = torch.tensor(player_ids, dtype=torch.long)
-        self.t = torch.tensor(team_ids, dtype=torch.long)
-        self.o = torch.tensor(opponent_ids, dtype=torch.long)
 
-    def __len__(self): return len(self.X)
-    def __getitem__(self, idx):
-        return self.X[idx], self.p[idx], self.t[idx], self.o[idx], self.y[idx]
+# Create a DataFrame combining PCA + names + cluster
+#pca_interactive_df = pca_2d_df.copy()
+#pca_interactive_df['athlete_display_name'] = train_player_summary['athlete_display_name']
 
-train_loader = DataLoader(
-    NBAGameDataset(X_train, y_train, player_ids_train, team_ids_train, opp_ids_train),
-    batch_size=128, shuffle=False
+# Set Plotly to open in browser
+#pio.renderers.default = 'browser'
+
+# Force cluster_label to str, so Plotly treats it as categorical
+#pca_interactive_df['cluster_label'] = pca_interactive_df['cluster_label'].astype(str)
+
+# Scatter plot
+#fig = px.scatter(pca_interactive_df, x='PC1', y='PC2', color='cluster_label',
+#                 hover_data=['athlete_display_name'],
+#                 title='Interactive PCA of Players Colored by Cluster',
+#                 color_discrete_sequence=px.colors.qualitative.Set1, width=1000, 
+#                 height=700)
+#fig.update_traces(marker=dict(size=8, line=dict(width=1, color='DarkSlateGrey')))
+#fig.update_layout(legend_title_text='Cluster Label', coloraxis_showscale=False)
+#fig.show()
+
+# ---------------------------------------------------
+# Add Cluster Labels to Gamelogs
+# ---------------------------------------------------
+
+# Keep only athlete name and cluster_label from train_player_summary (NOT from test!)
+player_clusters = train_player_summary[['athlete_display_name', 'cluster_label']].copy()
+player_clusters['cluster_label'] = player_clusters['cluster_label'].astype('float32')
+
+player_clusters.to_parquet('player_clusters.parquet')
+
+# Merge cluster labels into gamelogs
+gamelogs = gamelogs.merge(player_clusters, on='athlete_display_name', how='left')
+
+# Add cluster label to predictors
+features += ['cluster_label', 'was_missing']
+categorical_features += ['cluster_label', 'was_missing']
+
+# Convert all int32 columns to float32 in gamelogs
+gamelogs[gamelogs.select_dtypes('int32').columns] = \
+    gamelogs.select_dtypes('int32').astype('float32')
+
+# ---------------------------------------------------
+# Train/Validation Split for Feature Selection
+# ---------------------------------------------------
+
+# Ensure uniqueness in lists
+numeric_features = list(dict.fromkeys(numeric_features))
+categorical_features = list(dict.fromkeys(categorical_features))
+features = list(dict.fromkeys(features))
+
+train_df = gamelogs[gamelogs["season"] < 2025].copy()
+val_df = gamelogs[gamelogs["season"] >= 2025].copy()
+
+X_train = train_df[features]
+X_val = val_df[features]
+
+# Split targets
+y_train_regression = train_df[targets]
+y_val_regression = val_df[targets]
+
+# Preprocessing pipeline
+preprocessor = ColumnTransformer([
+    ('num', Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),  # Impute numeric missing with median
+        ('scaler', StandardScaler())                   # Scale numeric features after imputation
+    ]), numeric_features),
+    
+    ('cat', Pipeline([
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),  # Impute categoricals
+        ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False, dtype=np.float32))  # One-hot encode
+    ]), categorical_features)
+])
+
+X_train_proc = preprocessor.fit_transform(X_train)
+X_val_proc = preprocessor.transform(X_val)
+
+selector = VarianceThreshold(threshold=0.0)
+X_train_proc = selector.fit_transform(X_train_proc)
+X_val_proc = selector.transform(X_val_proc)
+
+# ---------------------------------------------------
+# Feature Selection via Lasso
+# ---------------------------------------------------
+
+# Fit MultiTaskLasso
+multi_task_lasso = MultiTaskLasso(
+    alpha=0.05,  
+    max_iter=5000,
+    random_state=42
 )
-val_loader = DataLoader(
-    NBAGameDataset(X_val, y_val, player_ids_val, team_ids_val, opp_ids_val),
-    batch_size=128, shuffle=False
-)
 
-# ---------------------------------------------------
-# Model Definition
-# ---------------------------------------------------
-class PositionalEncoding(nn.Module):
-    def __init__(self, dim, max_len=5000):
-        super().__init__()
-        pe = torch.zeros(max_len, dim)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2).float() * (-np.log(10000.0) / dim))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.pe = pe.unsqueeze(0)
+multi_task_lasso.fit(X_train_proc, y_train_regression)
 
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1), :].to(x.device)
-
-class NBAStatPredictor(nn.Module):
-    def __init__(self, input_dim, output_dim, num_players, num_teams):
-        super().__init__()
-        self.player_embed = nn.Embedding(num_players, 16)
-        self.team_embed   = nn.Embedding(num_teams, 8)
-        self.opp_embed    = nn.Embedding(num_teams, 8)
-
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
-            nn.LayerNorm(64),
-            nn.GELU()
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(64 + 16 + 8 + 8, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.GELU()
-        )
-        self.heads = nn.ModuleDict({
-            name: nn.Linear(64, 1) for name in targets
-        })
-
-    def forward(self, x, p, t, o):
-        e_p = self.player_embed(p)
-        e_t = self.team_embed( t)
-        e_o = self.opp_embed(  o)
-        x   = self.input_proj(x)
-        x   = torch.cat([x, e_p, e_t, e_o], dim=1)
-        x   = self.fc(x)
-        return torch.cat([self.heads[name](x) for name in self.heads], dim=1)
-
-model = NBAStatPredictor(
-    input_dim=X_train.shape[1],
-    output_dim=y_train.shape[1],
-    num_players=len(player_le.classes_),
-    num_teams=len(team_le.classes_)
-)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-
-# ---------------------------------------------------
-# Training Loop
-# ---------------------------------------------------
-def train(model, train_loader, val_loader, train_weights, epochs=20):
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
-    criterion = nn.SmoothL1Loss(reduction='none')
-    weights_t = torch.tensor(train_weights, dtype=torch.float32)
-
-    for epoch in range(1, epochs+1):
-        model.train()
-        total_loss = 0
-        start = 0
-        for xb, pb, tb, ob, yb in train_loader:
-            yb_log = torch.log1p(yb)
-            bs = xb.size(0)
-            w  = weights_t[start:start+bs].to(xb.device)
-            start += bs
-
-            optimizer.zero_grad()
-            preds = model(xb, pb, tb, ob)
-            loss  = (criterion(preds, yb_log).mean(dim=1) * w).mean()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item() * bs
-
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for xb, pb, tb, ob, yb in val_loader:
-                yb_log = torch.log1p(yb)
-                preds  = model(xb, pb, tb, ob)
-                val_loss += criterion(preds, yb_log).mean().item() * xb.size(0)
-
-        print(f"Epoch {epoch:02d} | Train: {total_loss/len(train_loader.dataset):.4f} | Val: {val_loss/len(val_loader.dataset):.4f}")
-
-train(model, train_loader, val_loader, train_weights, epochs=20)
-
-# ---------------------------------------------------
-# Evaluation: RMSE + R2
-# ---------------------------------------------------
-def evaluate_to_parquet(model, val_loader, target_names, output_path="evaluation_metrics.parquet"):
-    model.eval()
-    y_true, y_pred = [], []
-    with torch.no_grad():
-        for xb, pb, tb, ob, yb in val_loader:
-            preds = model(xb, pb, tb, ob)
-            y_true.append(yb.numpy())
-            y_pred.append(torch.expm1(preds).numpy())
-
-    y_true = np.vstack(y_true)
-    y_pred = np.vstack(y_pred)
-
-    # build metrics table
-    records = []
-    for i, name in enumerate(target_names):
-        rmse = root_mean_squared_error(y_true[:, i], y_pred[:, i])
-        r2   = r2_score(y_true[:, i], y_pred[:, i])
-        records.append({
-            "target": name,
-            "rmse":    round(rmse, 3),
-            "r2":      round(r2,   3)
-        })
-
-    df = pd.DataFrame.from_records(records)
-    df.to_parquet(output_path, index=False)
-    print(f"Evaluation metrics saved to {output_path}")
-    return df
-
-metrics_df = evaluate_to_parquet(model, val_loader, targets)
+# Predict on validation set
+y_val_pred = multi_task_lasso.predict(X_val_proc)
+metrics_list = []
+for idx, target in enumerate(targets):
+    y_true = y_val_regression.iloc[:, idx]
+    y_pred = y_val_pred[:, idx]
+    r2 = r2_score(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = root_mean_squared_error(y_true, y_pred)
+    metrics_list.append({
+        'target': target,
+        'r2_score': r2,
+        'mae': mae,
+        'rmse': rmse
+    })
+# Create a dataframe to display results
+metrics_df = pd.DataFrame(metrics_list)
 print(metrics_df)
 
-# ---------------------------------------------------
-# 1. Save Preprocessor
-# ---------------------------------------------------
-joblib.dump(preprocessor, "preprocessor.pkl")
+# Get coefficients from MultiTaskLasso
+coefs = multi_task_lasso.coef_  # shape: (n_targets, n_features)
+
+# Feature names after preprocessing and variance threshold
+feature_names_after_preprocessing = preprocessor.get_feature_names_out()
+selected_feature_names = feature_names_after_preprocessing[selector.get_support()]
+
+# Build feature_coef dataframe (just like you wanted)
+feature_coef = pd.DataFrame({
+    'Feature': selected_feature_names,
+    'Coefficient': list(coefs.T)  # Each feature has a list of coefficients (one per target)
+})
+
+#print("Feature coefficients:")
+#print(feature_coef)
+
+# Build list of features where ANY target's coefficient ≠ 0
+new_features = [
+    selected_feature_names[i] 
+    for i in range(len(selected_feature_names)) 
+    if any(abs(coefs[:, i]) != 0)
+]
+
+#print("\nSelected features:")
+#print(new_features)
+print(f"\nTotal selected features: {len(new_features)}")
+
+# Get the indices of the selected features
+selected_indices = [
+    i for i in range(len(selected_feature_names))
+    if selected_feature_names[i] in new_features
+]
+
+joblib.dump(new_features, "selected_features.joblib")
+joblib.dump(selected_indices, "selected_indices.joblib")
+
+
+# Now subset X_train and X_val
+X_train_selected = X_train_proc[:, selected_indices]
+X_val_selected = X_val_proc[:, selected_indices]
+
+y_train_pred = multi_task_lasso.predict(X_train_proc)
+y_val_pred = multi_task_lasso.predict(X_val_proc)
+
+# 2. Stack predictions onto features
+X_train_stacked = np.hstack([X_train_selected, y_train_pred])
+X_val_stacked = np.hstack([X_val_selected, y_val_pred])
+
+print("New training data shape:", X_train_stacked.shape)
+print("New test data shape:", X_val_stacked.shape)
 
 # ---------------------------------------------------
-# 2. Save PyTorch Model
+# Neural Network Bin Classification
 # ---------------------------------------------------
-torch.save(model, "nba_model_full.pt")
-torch.save(model.state_dict(), "nba_model_weights.pt")
+
+bin_edges = {
+    'points': [0, 15, np.inf],
+    'assists': [0, 3, np.inf],
+    'rebounds': [0, 5, np.inf],
+    'steals': [0, 1, np.inf],
+    'blocks': [0, 1, np.inf],
+    'three_point_field_goals_made': [0, 2, np.inf]
+}
+
+def create_bins(df, targets, bin_edges):
+    binned_labels = {}
+    for target in targets:
+        bins = bin_edges[target]
+        binned_labels[target] = pd.cut(
+            df[target],
+            bins=bins,
+            labels=False,
+            include_lowest=True,
+            right=False
+        )
+    return pd.DataFrame(binned_labels, index=df.index)
+
+y_train_bins = create_bins(train_df, targets, bin_edges)
+y_val_bins = create_bins(val_df, targets, bin_edges)
+
+# Check class distribution for each target
+class_distributions = {}
+
+for target in y_train_bins.columns:
+    counts = y_train_bins[target].value_counts().sort_index()
+    class_distributions[target] = counts
+
+# Turn into a readable table
+distribution_df = pd.DataFrame(class_distributions).fillna(0).astype(int)
+distribution_df.index.name = 'Bin'
+
+print("\nClass distributions per target:")
+print(distribution_df)
+
+# Build the base Random Forest model
+rf = RandomForestClassifier(
+    n_estimators=500,          # Number of trees
+    max_depth=6,               # Max tree depth
+    class_weight='balanced',   # Handle class imbalance
+    random_state=42,
+    n_jobs=-1,
+    max_features='sqrt',
+    min_samples_split=2,
+    min_samples_leaf=1
+)
+
+multi_rf = MultiOutputClassifier(rf, n_jobs=-1)
+multi_rf.fit(X_train_stacked, y_train_bins)
+
+# Predict on validation set
+y_val_pred = multi_rf.predict(X_val_stacked)
+
+# Evaluation
+metrics_list = []
+
+for idx, target in enumerate(y_val_bins.columns):
+    y_true = y_val_bins.iloc[:, idx]
+    y_pred = y_val_pred[:, idx]
+    acc = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    metrics_list.append({
+        'target': target,
+        'accuracy': acc,
+        'precision_macro': precision,
+        'recall_macro': recall,
+        'f1_macro': f1
+    })
+
+metrics_df = pd.DataFrame(metrics_list)
+print("\nValidation Metrics per Target:")
+print(metrics_df)
+metrics_df.to_parquet("nba_clf_metrics.parquet", index=False)
+
+# Stack predictions
+y_train_pred = multi_rf.predict(X_train_stacked)
+X_train_stacked = np.hstack([X_train_stacked, y_train_pred])
+X_val_stacked = np.hstack([X_val_stacked, y_val_pred])
+
+# Confirm shapes
+print("New X_train shape:", X_train_stacked.shape)
+print("New X_val shape:", X_val_stacked.shape)
+
 
 # ---------------------------------------------------
-# 3. Save XGBoost Bin Models
+# Naive Model (Only predicting the mean)
 # ---------------------------------------------------
-for target, clf in models.items():
-    clf.save_model(f"bin_model_{target}.json")
+
+# For each target, predict the training mean (constant)
+naive_preds = np.tile(y_train_regression.mean().values, (X_val_stacked.shape[0], 1))
+
+# Evaluate
+naive_metrics_list = []
+for idx, target in enumerate(y_train_regression.columns):
+    y_true = y_val_regression.iloc[:, idx]
+    y_pred = naive_preds[:, idx]
+    rmse = root_mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    naive_metrics_list.append({
+        'target': target,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2
+    })
+naive_metrics_df = pd.DataFrame(naive_metrics_list)
+print(naive_metrics_df)
 
 # ---------------------------------------------------
-# 4. Save LabelEncoders
+# Neural Net Regression
 # ---------------------------------------------------
-joblib.dump(player_le, "player_encoder.pkl")
-joblib.dump(team_le,   "team_encoder.pkl")
-joblib.dump(opponent_le,"opponent_encoder.pkl")
+
+# Set up RandomForestRegressor
+rf_reg = RandomForestRegressor(
+    n_estimators=500,          # Number of trees
+    max_depth=6,              # You can tune this
+    random_state=42,
+    n_jobs=9,
+    max_features=0.75,
+    min_samples_split=2,
+    min_samples_leaf=1
+)
+
+multi_rf_reg = MultiOutputRegressor(rf_reg, n_jobs=1)
+multi_rf_reg.fit(X_train_stacked, y_train_regression)
+
+# Predict on validation stacked features
+y_val_pred_reg = multi_rf_reg.predict(X_val_stacked)
+
+# Evaluate
+metrics_list = []
+
+for idx, target in enumerate(y_train_regression.columns):
+    y_true = y_val_regression.iloc[:, idx]
+    y_pred = y_val_pred_reg[:, idx]
+    rmse = root_mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    metrics_list.append({
+        'target': target,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2
+    })
+
+regression_metrics_df = pd.DataFrame(metrics_list)
+print(regression_metrics_df)
+regression_metrics_df.to_parquet("evaluation_metrics.parquet", index=False)
 
 # ---------------------------------------------------
-# 5. Save Manual Bin Boundaries
+# Save Models and Preprocessor
 # ---------------------------------------------------
-with open("manual_bins.json", "w") as f:
-    json.dump(manual_bins, f)
+
+joblib.dump(selector, 'variance_threshold_selector.joblib')
+joblib.dump(kmeans_final, 'nba_player_clustering.joblib')
+joblib.dump(preprocessor, "preprocessor_pipeline.joblib")
+joblib.dump(multi_task_lasso, "multi_task_lasso_model.joblib")
+joblib.dump(multi_rf, "multi_rf_classifier_model.joblib")
+joblib.dump(multi_rf_reg, "multi_rf_regressor_model.joblib")

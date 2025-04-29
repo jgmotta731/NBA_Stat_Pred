@@ -160,7 +160,7 @@ ui <- tagList(
 server <- function(input, output, session) {
   # --- reactive reader for the parquet file, now every 12 hours ---
   preds_df <- reactiveFileReader(
-    intervalMillis = 12 * 60 * 60 * 1000,  # 12 hours = 12 × 60 min × 60 s × 1000 ms
+    intervalMillis = 1 * 60 * 60 * 1000,
     session        = session,
     filePath       = "nba_predictions.parquet",
     readFunc       = arrow::read_parquet
@@ -201,6 +201,7 @@ server <- function(input, output, session) {
     reactable(
       df,
       searchable      = TRUE,
+      filterable = TRUE,
       defaultPageSize = 7,
       defaultSorted   = "Date",
       highlight       = TRUE,

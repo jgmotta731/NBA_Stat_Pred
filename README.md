@@ -1,106 +1,92 @@
 # 🏀 NBA Player Stat Prediction
 
-Predict NBA player game stats (points, rebounds, assists, steals, blocks, and three-pointers made) to help gain an edge in sports betting.
+Predict per-game NBA player stats to gain an edge in **sports betting**, **fantasy sports**, and **basketball analytics**.
 
-Built with advanced machine learning techniques, clustering, feature selection, model stacking, and served via a Shiny App for easy interaction.
-
----
-
-## 📈 Project Overview
-
-- **Goal:** Predict NBA player performance for upcoming games.
-- **Use Cases:** 
-  - Sports betting edge
-  - Daily Fantasy Sports (DFS) projections
-  - Basketball analytics research
-- **Target Stats Predicted:**
-  - Points
-  - Rebounds
-  - Assists
-  - Steals
-  - Blocks
-  - 3PT Field Goals Made
+This project integrates advanced machine learning, temporal validation, player clustering, and model stacking. A **Shiny app** provides interactive access to predictions and model insights.
 
 ---
 
-## 🔥 Key Methods
+## 📌 Project Goals
 
-- **Data Preparation:**
-  - Raw NBA gamelogs from the 2022 season onwards
-  - Only players with ≥10 games and ≥20 minutes/game included
-  - Rolling averages, momentum features, team offense/defense rankings
-  
-- **Feature Engineering:**
-  - Rolling 10-game statistics
-  - Player momentum indicators
-  - Win streak and loss streak tracking
-  - Opponent defensive efficiency
-  - Safe handling of missing values
-
-- **Dimensionality Reduction & Clustering:**
-  - Principal Component Analysis (PCA) for player profile compression
-  - Temporally split and aggregated gamelogs by player for clustering
-  - KMeans clustering with K=3 (optimal K selected via elbow and silhouette methods)
-  - Cluster labels used as additional model features
-  - 3 clusters achieved best silhouette score of 0.40
-
-- **Feature Selection:**
-  - MultiTask Lasso Regression (`MultiTaskLasso`) for shrinkage and selection
-  - Only features with non-zero coefficients retained
-
-- **Model Stacking:**
-  - Base model: MultiTask Lasso Regression (continuous predictions)
-  - Classification layer: Random Forest Classifier (`MultiOutputClassifier`) to predict binned outcomes
-  - Final model: Random Forest Regressor (`MultiOutputRegressor`) trained on stacked features + predictions
-
-- **Evaluation Metrics:**
-  - R² Score
-  - RMSE (Root Mean Squared Error)
-  - MAE (Mean Absolute Error)
-  - Precision, Recall, F1 for classification tasks
-  
-- **Baseline Comparison:**
-  - Compared against a naive model predicting mean outcomes for each stat
+- Forecast individual player stats (points, rebounds, assists, etc.) for upcoming NBA games
+- Generate predictive features using rolling averages, trends, and opponent metrics
+- Create a full ML pipeline including preprocessing, PCA, clustering, regression, classification, and stacking
+- Serve results via a user-friendly web app
 
 ---
 
-## 🚀 Shiny App
+## 🎯 Target Stats
 
-A custom [**Shiny App**](https://jmotta31.shinyapps.io/NBA_Prediction_Tool/) was built to make predictions easily accessible!
-
-**Shiny App Features:**
-
-- 📈 **Prediction Table:**  
-  Dynamic `reactable` table listing player predictions for upcoming games.
-  
-- 🎯 **Implied Probability Calculator:**  
-  Input the **American Odds** for a player prop to automatically compute:
-  - Implied probability
-  - Whether the model's projection suggests an edge.
-
-- 📊 **Model Metrics Dashboard:**  
-  Displaying final model evaluation metrics across targets.
+- Points  
+- Rebounds  
+- Assists  
+- Steals  
+- Blocks  
+- 3PT Field Goals Made
 
 ---
 
-## 🛠️ Tech Stack
+## 🧠 Methodology Overview
 
-- **Languages:** Python 3.11, R (for Shiny)
-- **Libraries:**
-  - `scikit-learn`, `pandas`, `numpy`, `seaborn`, `plotly`, `nba_api`
-  - `joblib` (for model persistence)
-  - `shiny`, `reactable`, `dplyr`, `tidyverse` (in the R Shiny App)
+### 🔧 Data Processing
+- NBA gamelogs from 2022 onward (`.parquet` format)
+- Filter players with ≥20 games and ≥15 minutes per game
+- Downcasting types for memory efficiency
+- Remove DNP and missing targets
+
+### 🏗️ Feature Engineering
+- Rolling window stats (5 and 20 games): mean, std, z-score, momentum, etc.
+- Trend slope, intercept, and R² via linear regression
+- Opponent- and team-level rolling stats
+- Expanding stats and win/loss streak indicators
+- Categorical encoding and missing data flagging
+
+### 📉 Dimensionality Reduction + Clustering
+- Apply PCA on player-season summaries
+- KMeans clustering (optimal K=3 via elbow + silhouette)
+- Use cluster labels as model features
+
+### 🔁 Model Stack
+1. **Base Regression:** Linear models for continuous prediction  
+2. **Secondary Regression:** Key contributing stats (e.g., FGA, minutes, team points)  
+3. **Classification Layer:** Predict binned outcomes via logistic regression  
+4. **Meta Model:** Final prediction via stacked features using `XGBoost`
+
+### 🧪 Evaluation
+- Metrics: RMSE, MAE, R² (regression), Accuracy, Precision, Recall, F1 (classification)
+- Naive benchmark included (predict mean values)
 
 ---
 
-## 📂 Project Structure
+## 💻 Shiny App: [NBA Prediction Tool](https://jmotta31.shinyapps.io/NBA_Prediction_Tool/)
+
+### App Features:
+- 📋 **Prediction Table**: View predicted player stats
+- 🎯 **Betting Edge Tool**: Enter odds to compute implied probabilities and model-based edge
+- 📊 **Evaluation Dashboard**: Displays key performance metrics
+
+---
+
+## 🛠 Tech Stack
+
+**Python (ML Pipeline):**  
+- `scikit-learn`, `xgboost`, `pandas`, `numpy`, `joblib`, `matplotlib`, `seaborn`
+
+**R (Web App):**  
+- `shiny`, `reactable`, `tidyverse`
+
+---
+
+## 📁 Directory Structure
 
 ```bash
 NBA_Stat_Pred/
-├── NBA_Stat_Pred.py             # Main Python training and prediction pipeline
-├── nba_predictions.py           # Python script to generate predictions for upcoming games
-├── update_nba_data.R            # R script to update/generate input data
-├── Pivoted_Betting_Odds.csv     # Data obtained from Odds API containing players with upcoming props
-├── app.R                        # R Shiny App
-├── www/                         # Shiny app images generated by Dall-E
-└── README.md                    # This file
+├── NBA_Stat_Pred.py             # Main model training pipeline
+├── nba_classes.py               # Class used in nba_predictions.py
+├── nba_predictions.py           # Script for generating new game predictions
+├── update_nba_data.R            # R script to update datasets
+├── app.R                        # Shiny App frontend
+├── nba_predictions.parquet      # Generated predictions for upcoming games, used for running the app locally
+├── evaluation_metrics.parquet   # Model metrics, also used for running Shiny app locally
+├── www/                         # Images used in the app
+└── README.md                    # Project documentation

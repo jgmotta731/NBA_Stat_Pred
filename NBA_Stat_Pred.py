@@ -7,26 +7,23 @@ Created on Sun Apr 20 2025
 # ---------------------------------------------------
 # Imports & Seed Setup
 # ---------------------------------------------------
-
 import os, random, joblib, gc, warnings
-from joblib import dump
+from joblib import Parallel, delayed
 import numpy as np
 import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
-from sklearn.pipeline import Pipeline
+from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, FunctionTransformer
 from sklearn.metrics import root_mean_squared_error, r2_score, precision_score, f1_score, recall_score, accuracy_score, silhouette_score, mean_absolute_error
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.cluster import KMeans
 from sklearn.feature_selection import VarianceThreshold
-from sklearn.linear_model import MultiTaskLasso
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-import seaborn as sns
-import matplotlib.pyplot as plt
-import plotly.express as px
-import plotly.io as pio
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from xgboost import XGBRegressor
 
 warnings.filterwarnings("ignore")
 SEED = 42
@@ -38,7 +35,6 @@ pd.set_option('display.max_columns', 10)
 # ---------------------------------------------------
 # Load & Prepare Data
 # ---------------------------------------------------
-
 gamelogs = pd.read_parquet('nba_gamelogs.parquet')
 # downcast numeric types
 gamelogs[gamelogs.select_dtypes('float64').columns] = \
@@ -61,11 +57,11 @@ gamelogs = gamelogs.dropna(subset=targets).copy()
 player_game_counts = gamelogs.groupby("athlete_display_name").size()
 
 # Keep only players with >=10 valid games
-valid_players = player_game_counts[player_game_counts >= 10].index
+valid_players = player_game_counts[player_game_counts >= 20].index
 gamelogs = gamelogs[gamelogs["athlete_display_name"].isin(valid_players)].copy()
 
 # After filtering players ➔ filter low-minute games
-gamelogs = gamelogs[gamelogs["minutes"] >= 20].reset_index(drop=True)
+gamelogs = gamelogs[gamelogs["minutes"] >= 15].reset_index(drop=True)
 
 # Clean up
 del valid_players, player_game_counts
@@ -74,7 +70,18 @@ gc.collect()
 # ---------------------------------------------------
 # Feature Engineering
 # ---------------------------------------------------
+gamelogs = gamelogs.sort_values(['game_date', 'athlete_display_name', 'team_abbreviation']).reset_index(drop=True)
 
+# Clean up plus_minus column
+if 'plus_minus' in gamelogs.columns:
+    gamelogs['plus_minus'] = (
+        gamelogs['plus_minus']
+        .astype(str)                                 # ensure string for replace
+        .str.replace(r'^\+', '', regex=True)         # remove leading '+'
+        .replace('None', np.nan)                     # convert 'None' to np.nan
+        .astype(np.float32)                          # final dtype conversion
+        )
+    
 # Convert booleans to numeric
 for col in ['starter', 'ejected', 'team_winner', 'is_playoff']:
     if col in gamelogs.columns:
@@ -84,131 +91,207 @@ rolling_cols = [
     'field_goals_made', 'field_goals_attempted', 'three_point_field_goals_made',
     'three_point_field_goals_attempted', 'free_throws_made', 'free_throws_attempted',
     'offensive_rebounds', 'defensive_rebounds', 'rebounds', 'assists', 'steals', 'blocks',
-    'turnovers', 'fouls', 'points', 'minutes'
+    'turnovers', 'fouls', 'points', 'minutes', 'plus_minus'
 ]
 
-gamelogs = gamelogs.sort_values(by=['season', 'game_date', 'team_abbreviation', 'athlete_display_name'])
-
+gamelogs = gamelogs.sort_values(['game_date', 'season', 'athlete_display_name']).reset_index(drop=True)
 gamelogs['is_playoff'] = gamelogs['season_type'].isin([3, 5]).astype(np.int32)
 gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'])
 gamelogs['days_since_last_game'] = gamelogs.groupby('athlete_display_name')['game_date'].diff().dt.days.astype(np.float32)
 
-# Rolling Metrics: 10, shifted
-for window in [10]:
-    for col in rolling_cols:
-        # Rolling Averages
-        gamelogs[f'{col}_rolling{window}'] = (
-            gamelogs.groupby('athlete_display_name')[col]
+# Safe division to avoid errors
+def safe_divide(numerator, denominator, eps=1e-3):
+    return numerator / (denominator + eps)
+
+# Rolling Features Function
+def compute_rolling_features(col):
+    result = pd.DataFrame(index=gamelogs.index)
+    for window in [5, 20]:
+        def apply_rolling(series):
+            shifted = series.shift(1)
+            roll_mean = shifted.rolling(window=window, min_periods=1).mean()
+            roll_std = shifted.rolling(window=window, min_periods=1).std()
+            shift2 = series.shift(2)
+            roll_shift2_mean = shift2.rolling(window=window, min_periods=1).mean()
+            ewm_mean = series.shift(1).ewm(span=window, adjust=False).mean()
+            return pd.DataFrame({
+                f'{col}_rolling{window}': roll_mean,
+                f'{col}_rolling_std{window}': roll_std,
+                f'{col}_rolling_zscore{window}': (shifted - roll_mean) / (roll_std + 1e-6),
+                f'{col}_momentum{window}': shifted - roll_shift2_mean,
+                f'{col}_rolling_cv{window}': roll_std / (roll_mean + 1e-6),
+                f'{col}_consistency_index_rolling{window}': roll_mean / (roll_std + 1e-6),
+                f'{col}_ewm_rolling{window}': ewm_mean,}, index=series.index)
+        # Apply per player
+        rolled = gamelogs[[col, 'athlete_display_name']].groupby(
+            'athlete_display_name', group_keys=False)[col].apply(apply_rolling).reset_index(level=0, drop=True)
+        # Add global season rank
+        rolled[f'{col}_global_rolling_rank{window}'] = (
+            rolled[f'{col}_rolling{window}']
+            .groupby(gamelogs['season']).rank(method="average", pct=True).astype(np.float32))
+        result = pd.concat([result, rolled], axis=1)
+    return result
+results = Parallel(n_jobs=-1, backend="loky", verbose=1)(delayed(compute_rolling_features)(col) for col in rolling_cols)
+gamelogs = pd.concat([gamelogs] + results, axis=1)
+
+# Trend Slope Calculation
+def compute_trend_stats_for_player(name, group, col, window):
+    group = group.sort_values("game_date")
+    values = group[col].shift(1).to_numpy()
+    indices = group.index.to_numpy()
+    slopes = np.full(len(values), np.nan, dtype=np.float32)
+    intercepts = np.full(len(values), np.nan, dtype=np.float32)
+    r2_scores = np.full(len(values), np.nan, dtype=np.float32)
+    for i in range(window - 1, len(values)):
+        y = values[i - window + 1:i + 1]
+        x = np.arange(len(y)).reshape(-1, 1)
+        mask = ~np.isnan(y)
+        if np.count_nonzero(mask) >= 3 and not np.allclose(y[mask], y[mask][0]):
+            try:
+                model = LinearRegression().fit(x[mask], y[mask])
+                y_pred = model.predict(x[mask])
+                slopes[i] = model.coef_[0]
+                intercepts[i] = model.intercept_
+                r2_scores[i] = r2_score(y[mask], y_pred)
+            except Exception:
+                continue
+    return indices, slopes, intercepts, r2_scores
+
+# Apply for each target column and window
+for window in [5, 20]:
+    for col in targets:
+        results = Parallel(n_jobs=-1, backend="loky", verbose=1)(
+            delayed(compute_trend_stats_for_player)(name, group, col, window)
+            for name, group in gamelogs.groupby('athlete_display_name'))
+        slope_vals = np.full(len(gamelogs), np.nan, dtype=np.float32)
+        intercept_vals = np.full(len(gamelogs), np.nan, dtype=np.float32)
+        r2_vals = np.full(len(gamelogs), np.nan, dtype=np.float32)
+        for indices, slopes, intercepts, r2s in results:
+            slope_vals[indices] = slopes
+            intercept_vals[indices] = intercepts
+            r2_vals[indices] = r2s
+        gamelogs[f'{col}_trend_slope_{window}'] = slope_vals
+        gamelogs[f'{col}_trend_intercept_{window}'] = intercept_vals
+        gamelogs[f'{col}_trend_r2_{window}'] = r2_vals
+
+def compute_opponent_team_rolling(window):
+    df = pd.DataFrame(index=gamelogs.index)
+    # Team/Opponent Stat Rolling Features
+    for group_col, stat_col, label in [
+        ("opponent_team_abbreviation", "team_score", "opponent_points_allowed"),
+        ("opponent_team_abbreviation", "three_point_field_goals_made", "opponent_3pm_allowed"),
+        ("opponent_team_abbreviation", "field_goals_made", "opponent_fgm_allowed"),
+        ("opponent_team_abbreviation", "rebounds", "opponent_rebounds_allowed"),
+        ("team_abbreviation", "team_score", "team_score"),
+        ("team_abbreviation", "rebounds", "team_rebounds"),
+        ("team_abbreviation", "turnovers", "team_turnovers"),
+        ("team_abbreviation", "three_point_field_goals_made", "team_3pm"),
+        ("team_abbreviation", "three_point_field_goals_attempted", "team_3pa"),
+        ("team_abbreviation", "assists", "team_assists"),
+        ]:
+        df[f"{label}_rolling{window}"] = (
+            gamelogs[[stat_col, group_col]]
+            .groupby(group_col)[stat_col]
             .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-        ).astype(np.float32)
-
-        # Momentum
-        gamelogs[f'{col}_momentum{window}'] = (
-            gamelogs.groupby('athlete_display_name')[col]
-            .transform(lambda x: x.shift(1)) - 
-            gamelogs.groupby('athlete_display_name')[col]
-            .transform(lambda x: x.shift(2).rolling(window, min_periods=1).mean())
-        ).astype(np.float32)
-
-        # Global rolling rank
-        gamelogs[f'{col}_global_rolling_rank{window}'] = (
-            gamelogs.groupby('game_date')[f'{col}_rolling{window}']
-            .rank(method="average", pct=True)
-        ).astype(np.float32)
-
-    # Efficiency ratios
-    gamelogs[f'assist_to_turnover_rolling{window}'] = (
-        gamelogs[f'assists_rolling{window}'] / (gamelogs[f'turnovers_rolling{window}'] + 1)
-    ).astype(np.float32)
-
-    gamelogs[f'orb_pct_rolling{window}'] = (
-        gamelogs[f'offensive_rebounds_rolling{window}'] / gamelogs[f'rebounds_rolling{window}']
-    ).astype(np.float32)
-
-    gamelogs[f'fg_pct_rolling{window}'] = (
-        gamelogs[f'field_goals_made_rolling{window}'] / gamelogs[f'field_goals_attempted_rolling{window}']
-    ).astype(np.float32)
-
-    gamelogs[f'ft_pct_rolling{window}'] = (
-        gamelogs[f'free_throws_made_rolling{window}'] / gamelogs[f'free_throws_attempted_rolling{window}']
-    ).astype(np.float32)
-
-for window in [10]:
-    # Opponent Defense
-    gamelogs[f"opponent_team_score_rolling{window}"] = (
-        gamelogs.groupby("opponent_team_abbreviation")["opponent_team_score"]
-        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-    ).astype(np.float32)
-
-    gamelogs[f"opponent_points_allowed_rolling{window}"] = (
-        gamelogs.groupby("opponent_team_abbreviation")["team_score"]
-        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-    ).astype(np.float32)
-
-    gamelogs[f"opponent_defense_rank_rolling{window}"] = (
-        gamelogs.groupby("season")[f"opponent_points_allowed_rolling{window}"]
+            ).astype(np.float32)
+    # Rankings
+    df[f"opponent_defense_rank_rolling{window}"] = (
+        df[f"opponent_points_allowed_rolling{window}"]
+        .groupby(gamelogs["season"])
         .rank(method="average", pct=True)
-    ).astype(np.float32)
-
-    # Team Offense
-    gamelogs[f"team_score_rolling{window}"] = (
-        gamelogs.groupby("team_abbreviation")["team_score"]
-        .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-    ).astype(np.float32)
-
-    gamelogs[f"team_offense_rank_rolling{window}"] = (
-        gamelogs.groupby("season")[f"team_score_rolling{window}"]
+        ).astype(np.float32)
+    df[f"team_offense_rank_rolling{window}"] = (
+        df[f"team_score_rolling{window}"]
+        .groupby(gamelogs["season"])
         .rank(method="average", pct=True)
-    ).astype(np.float32)
+        ).astype(np.float32)
+    # Derived stats (assist-to-turnover, efficiency, usage rate)
+    df[f'assist_to_turnover_rolling{window}'] = safe_divide(
+        gamelogs[f'assists_rolling{window}'],
+        gamelogs[f'turnovers_rolling{window}']
+        ).astype(np.float32)
+    df[f'orb_pct_rolling{window}'] = safe_divide(
+        gamelogs[f'offensive_rebounds_rolling{window}'],
+        gamelogs[f'rebounds_rolling{window}']
+        ).astype(np.float32)
+    df[f'fg_pct_rolling{window}'] = safe_divide(
+        gamelogs[f'field_goals_made_rolling{window}'],
+        gamelogs[f'field_goals_attempted_rolling{window}']
+        ).clip(0, 1).astype(np.float32)
+    df[f'ft_pct_rolling{window}'] = safe_divide(
+        gamelogs[f'free_throws_made_rolling{window}'],
+        gamelogs[f'free_throws_attempted_rolling{window}']
+        ).clip(0, 1).astype(np.float32)
+    df[f'three_pt_pct_rolling{window}'] = safe_divide(
+        gamelogs[f'three_point_field_goals_made_rolling{window}'],
+        gamelogs[f'three_point_field_goals_attempted_rolling{window}']
+        ).clip(0, 1).astype(np.float32)
+    df[f'usage_proxy_rolling{window}'] = safe_divide(
+        gamelogs[f'field_goals_attempted_rolling{window}'] +
+        gamelogs[f'free_throws_attempted_rolling{window}'] +
+        gamelogs[f'turnovers_rolling{window}'],
+        gamelogs[f'minutes_rolling{window}']
+        ).astype(np.float32)
+    return df
+team_results = Parallel(n_jobs=-1, backend="loky", verbose=1)(delayed(compute_opponent_team_rolling)(window) for window in [5, 20])
+gamelogs = pd.concat([gamelogs] + team_results, axis=1)
 
-# Rolling Win Streak
+def compute_expanding_features(col):
+    df = pd.DataFrame(index=gamelogs.index)
+    sorted_gamelogs = gamelogs.sort_values('game_date')
+    # Grouping
+    group = sorted_gamelogs.groupby(['athlete_display_name', 'season'])[col]
+    # Expanding mean and std (shifted to avoid leakage)
+    expanding_mean = group.transform(lambda x: x.shift(1).expanding().mean()).astype(np.float32)
+    expanding_std = group.transform(lambda x: x.shift(1).expanding().std()).astype(np.float32)
+    df[f'{col}_season_expanding_mean'] = expanding_mean
+    df[f'{col}_season_expanding_std'] = expanding_std
+    # Z-score
+    df[f'{col}_season_expanding_zscore'] = (
+        (sorted_gamelogs[col].shift(1) - expanding_mean) / (expanding_std + 1e-6)
+        ).astype(np.float32)
+    # CV and Consistency
+    df[f'{col}_season_expanding_cv'] = (expanding_std / (expanding_mean + 1e-6)).astype(np.float32)
+    df[f'{col}_season_consistency_index'] = (expanding_mean / (expanding_std + 1e-6)).astype(np.float32)
+    # Rank (global across dataset, not grouped — optional)
+    df[f'{col}_season_expanding_rank'] = expanding_mean.rank(method='average', pct=True).astype(np.float32)
+    # Rolling vs. Opponent
+    df[f'{col}_rolling_vs_opp5'] = (
+        sorted_gamelogs
+        .groupby(['athlete_display_name', 'opponent_team_abbreviation'])[col]
+        .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
+        ).astype(np.float32)
+    return df
+expanding_results = Parallel(n_jobs=-1, backend="loky", verbose=1)(delayed(compute_expanding_features)(col) for col in rolling_cols)
+gamelogs = pd.concat([gamelogs] + expanding_results, axis=1)
+
 gamelogs['rolling_win_streak'] = (
     gamelogs.sort_values(['athlete_display_name', 'game_date'])
     .groupby('athlete_display_name')['team_winner']
     .transform(lambda x: x.shift(1).groupby((x.shift(1) != 1).cumsum()).cumcount())
 ).astype(np.int32)
 
-# Rolling Loss Streak
 gamelogs['rolling_loss_streak'] = (
     gamelogs.sort_values(['athlete_display_name', 'game_date'])
     .groupby('athlete_display_name')['team_winner']
     .transform(lambda x: x.shift(1).groupby((x.shift(1) != 0).cumsum()).cumcount())
 ).astype(np.int32)
 
-# Safe division (clip small denominators)
-def safe_divide(numerator, denominator, eps=1e-3):
-    return numerator / (denominator + eps)
-
-gamelogs[f'fg_pct_rolling{window}'] = safe_divide(
-    gamelogs[f'field_goals_made_rolling{window}'],
-    gamelogs[f'field_goals_attempted_rolling{window}']
-).clip(0, 1).astype(np.float32)
-
 # ---------------------------------------------------
 # Feature Selection
 # ---------------------------------------------------
-
 gamelogs = gamelogs.drop(columns=[
-    'minutes', 'plus_minus', 'field_goals_made', 'field_goals_attempted',
-    'three_point_field_goals_attempted', 'turnovers', 'fouls',
-    'free_throws_attempted', 'free_throws_made', 'ejected',
-    'did_not_play', 'team_winner', 'team_score', 'opponent_team_score', 'active',
+    'plus_minus', 'ejected', 'did_not_play', 'team_winner', 'active',
     'season_type', 'starter'
     ])
 
-available_cols = set(gamelogs.columns)
-
 lagged_rolling_features = [col for col in gamelogs.columns
-                           if 'rolling' in col or 'lag' in col]
+                           if 'rolling' in col or 'trend' in col or 'lag' in col 
+                           or 'expanding' in col or 'momentum' in col]
 
 numeric_features = lagged_rolling_features + ['days_since_last_game']
 categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff"]
 features = numeric_features + categorical_features
-
-# Ensure uniqueness in lists
-numeric_features = list(dict.fromkeys(numeric_features))
-categorical_features = list(dict.fromkeys(categorical_features))
-features = list(dict.fromkeys(features))
 
 # Add missing flag
 def add_generic_missing_flag(X_df, feature_list):
@@ -227,85 +310,15 @@ numeric_features = list(dict.fromkeys(numeric_features))
 categorical_features = list(dict.fromkeys(categorical_features))
 
 # ---------------------------------------------------
-# EDA
-# ---------------------------------------------------
-
-# Aggregate stats by player (take the mean of numeric features)
-player_summary = gamelogs.groupby('athlete_display_name')[numeric_features].mean().reset_index()
-
-# Calculate per-player averages for targets
-for target in ['points', 'assists', 'rebounds', 'steals', 'blocks', 'three_point_field_goals_made']:
-    player_summary[f'avg_{target}'] = gamelogs.groupby('athlete_display_name')[target].mean().values
-
-# Define bin edges
-bin_edges = {
-    'points': [0, 10, 15, 20, 25, 30, np.inf],
-    'assists': [0, 2, 4, 6, 8, np.inf],
-    'rebounds': [0, 4, 6, 8, 10, 12, np.inf],
-    'steals': [0, 1, 2, np.inf],
-    'blocks': [0, 1, 2, np.inf],
-    'three_point_field_goals_made': [0, 1, 2, 3, 4, np.inf]
-}
-
-# Bin them
-for target, edges in bin_edges.items():
-    player_summary[f'{target}_bin'] = pd.cut(
-        player_summary[f'avg_{target}'],
-        bins=edges,
-        labels=[f'{edges[i]}-{edges[i+1]}' if edges[i+1] != np.inf else f'{edges[i]}+' for i in range(len(edges)-1)],
-        right=False
-    )
-
-player_summary = player_summary.drop(columns=[f'avg_{target}' for target in 
-                                              ['points', 'assists', 'rebounds', 
-                                               'steals', 'blocks', 
-                                               'three_point_field_goals_made']])
-
-# Use PCA for visualizations
-eda_preprocessor = ColumnTransformer([
-    ('num', Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler())
-        ]), numeric_features)
-    ])
-
-eda_pipeline = Pipeline([
-    ('pre', eda_preprocessor),
-    ('pca', PCA(n_components=2, random_state=SEED))
-])
-
-X_eda = eda_pipeline.fit_transform(player_summary[numeric_features])
-
-pca_df = pd.DataFrame(X_eda, columns=['PC1', 'PC2'])
-for bin_col in ['points_bin', 'rebounds_bin', 'assists_bin', 'steals_bin', 
-                'blocks_bin', 'three_point_field_goals_made_bin']:
-    pca_df[bin_col] = player_summary[bin_col].values
-
-# Plot each bin separately
-bin_names = ['points_bin', 'rebounds_bin', 'assists_bin', 'steals_bin', 
-             'blocks_bin', 'three_point_field_goals_made_bin']
-
-# Plot
-for bin_name in bin_names:
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=pca_df, x='PC1', y='PC2', hue=bin_name, palette='tab10', 
-                    s=50, edgecolor='k')
-    plt.title(f'PCA of Player Summaries Colored by {bin_name.replace("_", " ").title()}', fontsize=16)
-    plt.xlabel('Principal Component 1', fontsize=14); plt.ylabel('Principal Component 2', fontsize=14)
-    plt.legend(title=bin_name.replace("_", " ").title(), fontsize=12, title_fontsize=13)
-    plt.grid(True, linestyle='--', alpha=0.5); plt.tight_layout(); plt.show()
-
-# ---------------------------------------------------
 # PCA + Clustering (with Temporal Train/Test Split)
 # ---------------------------------------------------
-
-# Step 1: Temporal Split
+# Temporal Split
 train_gamelogs = gamelogs[gamelogs['season'] < 2025].copy()
 
-# Step 2: Aggregate to Player Level Separately
+# Aggregate to Player Level Separately
 train_player_summary = train_gamelogs.groupby('athlete_display_name')[numeric_features].mean().reset_index()
 
-# Step 3: Preprocessing
+# Preprocessing
 preprocessor = ColumnTransformer([
     ('num', Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
@@ -313,7 +326,7 @@ preprocessor = ColumnTransformer([
     ]), numeric_features)
 ])
 
-# Step 4: Fit PCA only on train
+# Fit PCA only on train
 X_train_proc = preprocessor.fit_transform(train_player_summary[numeric_features])
 pca = PCA(random_state=SEED)
 X_train_pca = pca.fit_transform(X_train_proc)
@@ -331,7 +344,7 @@ plt.xlabel('Principal Component')
 plt.ylabel('Variance Explained')
 plt.title('Scree Plot'); plt.grid(True); plt.tight_layout(); plt.show()
 
-# Step 5: Fit PCA Pipeline
+# Fit PCA Pipeline
 pca_pipeline = Pipeline([
     ('preprocessor', preprocessor),
     ('pca', PCA(n_components=2, random_state=SEED))
@@ -385,37 +398,11 @@ plt.legend(title='Cluster Label', fontsize=12, title_fontsize=13)
 plt.grid(True, linestyle='--', alpha=0.5); plt.tight_layout(); plt.show()
 
 # ---------------------------------------------------
-# Interactive Scatterplot of Players
-# ---------------------------------------------------
-
-# Create a DataFrame combining PCA + names + cluster
-#pca_interactive_df = pca_2d_df.copy()
-#pca_interactive_df['athlete_display_name'] = train_player_summary['athlete_display_name']
-
-# Set Plotly to open in browser
-#pio.renderers.default = 'browser'
-
-# Force cluster_label to str, so Plotly treats it as categorical
-#pca_interactive_df['cluster_label'] = pca_interactive_df['cluster_label'].astype(str)
-
-# Scatter plot
-#fig = px.scatter(pca_interactive_df, x='PC1', y='PC2', color='cluster_label',
-#                 hover_data=['athlete_display_name'],
-#                 title='Interactive PCA of Players Colored by Cluster',
-#                 color_discrete_sequence=px.colors.qualitative.Set1, width=1000, 
-#                 height=700)
-#fig.update_traces(marker=dict(size=8, line=dict(width=1, color='DarkSlateGrey')))
-#fig.update_layout(legend_title_text='Cluster Label', coloraxis_showscale=False)
-#fig.show()
-
-# ---------------------------------------------------
 # Add Cluster Labels to Gamelogs
 # ---------------------------------------------------
-
 # Keep only athlete name and cluster_label from train_player_summary (NOT from test!)
 player_clusters = train_player_summary[['athlete_display_name', 'cluster_label']].copy()
 player_clusters['cluster_label'] = player_clusters['cluster_label'].astype('float32')
-
 player_clusters.to_parquet('player_clusters.parquet')
 
 # Merge cluster labels into gamelogs
@@ -429,10 +416,11 @@ categorical_features += ['cluster_label', 'was_missing']
 gamelogs[gamelogs.select_dtypes('int32').columns] = \
     gamelogs.select_dtypes('int32').astype('float32')
 
-# ---------------------------------------------------
-# Train/Validation Split for Feature Selection
-# ---------------------------------------------------
+gc.collect()
 
+# ---------------------------------------------------
+# Train/Validation Split
+# ---------------------------------------------------
 # Ensure uniqueness in lists
 numeric_features = list(dict.fromkeys(numeric_features))
 categorical_features = list(dict.fromkeys(categorical_features))
@@ -441,6 +429,10 @@ features = list(dict.fromkeys(features))
 train_df = gamelogs[gamelogs["season"] < 2025].copy()
 val_df = gamelogs[gamelogs["season"] >= 2025].copy()
 
+ 
+# ---------------------------------------------------
+# Preprocessing Pipeline
+# ---------------------------------------------------
 X_train = train_df[features]
 X_val = val_df[features]
 
@@ -449,114 +441,97 @@ y_train_regression = train_df[targets]
 y_val_regression = val_df[targets]
 
 # Preprocessing pipeline
-preprocessor = ColumnTransformer([
+column_transformer = ColumnTransformer([
     ('num', Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),  # Impute numeric missing with median
-        ('scaler', StandardScaler())                   # Scale numeric features after imputation
+        ('imputer', SimpleImputer(strategy='median')),
+        ('scale', StandardScaler()),
     ]), numeric_features),
-    
     ('cat', Pipeline([
-        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),  # Impute categoricals
-        ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=False, dtype=np.float32))  # One-hot encode
+        ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+        ('ohe', OneHotEncoder(handle_unknown='ignore', sparse_output=True, dtype=np.float32))
     ]), categorical_features)
+])
+
+# Wrap ColumnTransformer inside a full pipeline
+preprocessor = Pipeline([
+    ('transform', column_transformer),
+    ('variance', VarianceThreshold(threshold=0.01))
 ])
 
 X_train_proc = preprocessor.fit_transform(X_train)
 X_val_proc = preprocessor.transform(X_val)
 
-selector = VarianceThreshold(threshold=0.0)
-X_train_proc = selector.fit_transform(X_train_proc)
-X_val_proc = selector.transform(X_val_proc)
-
 # ---------------------------------------------------
-# Feature Selection via Lasso
+# Base Model
 # ---------------------------------------------------
+# Wrap LinearRegression in MultiOutputRegressor
+lr_base = LinearRegression()
+multi_lr = MultiOutputRegressor(lr_base)
+multi_lr.fit(X_train_proc, y_train_regression)
 
-# Fit MultiTaskLasso
-multi_task_lasso = MultiTaskLasso(
-    alpha=0.05,  
-    max_iter=5000,
-    random_state=42
-)
+# Predict on train and validation sets
+y_train_pred_lm = multi_lr.predict(X_train_proc)
+y_val_pred_lm = multi_lr.predict(X_val_proc)
 
-multi_task_lasso.fit(X_train_proc, y_train_regression)
-
-# Predict on validation set
-y_val_pred = multi_task_lasso.predict(X_val_proc)
+# Evaluate on validation set
 metrics_list = []
-for idx, target in enumerate(targets):
+for idx, target in enumerate(y_train_regression.columns):
     y_true = y_val_regression.iloc[:, idx]
-    y_pred = y_val_pred[:, idx]
-    r2 = r2_score(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = root_mean_squared_error(y_true, y_pred)
+    y_pred = y_val_pred_lm[:, idx]
     metrics_list.append({
         'target': target,
-        'r2_score': r2,
-        'mae': mae,
-        'rmse': rmse
+        'rmse': root_mean_squared_error(y_true, y_pred),
+        'mae': mean_absolute_error(y_true, y_pred),
+        'r2_score': r2_score(y_true, y_pred),
     })
-# Create a dataframe to display results
+
 metrics_df = pd.DataFrame(metrics_list)
 print(metrics_df)
 
-# Get coefficients from MultiTaskLasso
-coefs = multi_task_lasso.coef_  # shape: (n_targets, n_features)
-
-# Feature names after preprocessing and variance threshold
-feature_names_after_preprocessing = preprocessor.get_feature_names_out()
-selected_feature_names = feature_names_after_preprocessing[selector.get_support()]
-
-# Build feature_coef dataframe (just like you wanted)
-feature_coef = pd.DataFrame({
-    'Feature': selected_feature_names,
-    'Coefficient': list(coefs.T)  # Each feature has a list of coefficients (one per target)
-})
-
-#print("Feature coefficients:")
-#print(feature_coef)
-
-# Build list of features where ANY target's coefficient ≠ 0
-new_features = [
-    selected_feature_names[i] 
-    for i in range(len(selected_feature_names)) 
-    if any(abs(coefs[:, i]) != 0)
-]
-
-#print("\nSelected features:")
-#print(new_features)
-print(f"\nTotal selected features: {len(new_features)}")
-
-# Get the indices of the selected features
-selected_indices = [
-    i for i in range(len(selected_feature_names))
-    if selected_feature_names[i] in new_features
-]
-
-joblib.dump(new_features, "selected_features.joblib")
-joblib.dump(selected_indices, "selected_indices.joblib")
-
-
-# Now subset X_train and X_val
-X_train_selected = X_train_proc[:, selected_indices]
-X_val_selected = X_val_proc[:, selected_indices]
-
-y_train_pred = multi_task_lasso.predict(X_train_proc)
-y_val_pred = multi_task_lasso.predict(X_val_proc)
-
-# 2. Stack predictions onto features
-X_train_stacked = np.hstack([X_train_selected, y_train_pred])
-X_val_stacked = np.hstack([X_val_selected, y_val_pred])
-
-print("New training data shape:", X_train_stacked.shape)
-print("New test data shape:", X_val_stacked.shape)
 
 # ---------------------------------------------------
-# Neural Network Bin Classification
+# Secondary Targets Model
 # ---------------------------------------------------
+targets2 = ['minutes', 'field_goals_attempted', 'field_goals_made', 
+            'free_throws_attempted', 'free_throws_made',
+            'three_point_field_goals_attempted',
+            'team_score']
 
+y_train_regression2 = train_df[targets2]
+y_val_regression2 = val_df[targets2]
+
+# Define and fit Linear Regression
+lr_mt = MultiOutputRegressor(LinearRegression())
+lr_mt.fit(X_train_proc, y_train_regression2)
+
+# Predict on train/val
+y_train_pred_lm2 = lr_mt.predict(X_train_proc)
+y_val_pred_lm2 = lr_mt.predict(X_val_proc)
+
+# Evaluate
+metrics_list = []
+
+for idx, target in enumerate(targets2):
+    y_true = y_val_regression2.iloc[:, idx]
+    y_pred = y_val_pred_lm2[:, idx]
+    rmse = root_mean_squared_error(y_true, y_pred)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    metrics_list.append({
+        'target': target,
+        'rmse': rmse,
+        'mae': mae,
+        'r2': r2
+    })
+
+regression_metrics_df = pd.DataFrame(metrics_list)
+print(regression_metrics_df)
+
+# ---------------------------------------------------
+# Bin Classification Model
+# ---------------------------------------------------
 bin_edges = {
-    'points': [0, 15, np.inf],
+    'points': [0, 13, np.inf],
     'assists': [0, 3, np.inf],
     'rebounds': [0, 5, np.inf],
     'steals': [0, 1, np.inf],
@@ -594,63 +569,44 @@ distribution_df.index.name = 'Bin'
 print("\nClass distributions per target:")
 print(distribution_df)
 
-# Build the base Random Forest model
-rf = RandomForestClassifier(
-    n_estimators=500,          # Number of trees
-    max_depth=6,               # Max tree depth
-    class_weight='balanced',   # Handle class imbalance
+# Define Logistic Regression classifier with regularization
+logreg_clf = LogisticRegression(
+    solver='lbfgs',
+    class_weight='balanced',
+    multi_class='multinomial',
+    max_iter=1000,
     random_state=42,
-    n_jobs=-1,
-    max_features='sqrt',
-    min_samples_split=2,
-    min_samples_leaf=1
+    n_jobs=-1
 )
 
-multi_rf = MultiOutputClassifier(rf, n_jobs=-1)
-multi_rf.fit(X_train_stacked, y_train_bins)
+# Wrap in MultiOutputClassifier for multilabel support
+multi_logreg = MultiOutputClassifier(logreg_clf, n_jobs=1)
+multi_logreg.fit(X_train_proc, y_train_bins)
 
 # Predict on validation set
-y_val_pred = multi_rf.predict(X_val_stacked)
+y_val_pred_lr = multi_logreg.predict(X_val_proc)
+y_train_pred_lr = multi_logreg.predict(X_train_proc)
 
-# Evaluation
+# Evaluate
 metrics_list = []
-
 for idx, target in enumerate(y_val_bins.columns):
     y_true = y_val_bins.iloc[:, idx]
-    y_pred = y_val_pred[:, idx]
-    acc = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred, average='macro', zero_division=0)
-    recall = recall_score(y_true, y_pred, average='macro', zero_division=0)
-    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    y_pred = y_val_pred_lr[:, idx]
     metrics_list.append({
         'target': target,
-        'accuracy': acc,
-        'precision_macro': precision,
-        'recall_macro': recall,
-        'f1_macro': f1
+        'accuracy': accuracy_score(y_true, y_pred),
+        'precision_macro': precision_score(y_true, y_pred, average='macro', zero_division=0),
+        'recall_macro': recall_score(y_true, y_pred, average='macro', zero_division=0),
+        'f1_macro': f1_score(y_true, y_pred, average='macro', zero_division=0)
     })
 
 metrics_df = pd.DataFrame(metrics_list)
-print("\nValidation Metrics per Target:")
 print(metrics_df)
-metrics_df.to_parquet("nba_clf_metrics.parquet", index=False)
-
-# Stack predictions
-y_train_pred = multi_rf.predict(X_train_stacked)
-X_train_stacked = np.hstack([X_train_stacked, y_train_pred])
-X_val_stacked = np.hstack([X_val_stacked, y_val_pred])
-
-# Confirm shapes
-print("New X_train shape:", X_train_stacked.shape)
-print("New X_val shape:", X_val_stacked.shape)
-
 
 # ---------------------------------------------------
 # Naive Model (Only predicting the mean)
 # ---------------------------------------------------
-
-# For each target, predict the training mean (constant)
-naive_preds = np.tile(y_train_regression.mean().values, (X_val_stacked.shape[0], 1))
+naive_preds = np.tile(y_train_regression.mean().values, (X_val_proc.shape[0], 1))
 
 # Evaluate
 naive_metrics_list = []
@@ -670,53 +626,69 @@ naive_metrics_df = pd.DataFrame(naive_metrics_list)
 print(naive_metrics_df)
 
 # ---------------------------------------------------
-# Neural Net Regression
+# Stack Predictions
 # ---------------------------------------------------
+X_train_stacked = np.hstack([
+    X_train_proc,
+    y_train_pred_lr,   # Logistic Regression (classification bin predictions)
+    y_train_pred_lm2,  # Linear Regression on targets2
+    y_train_pred_lm    # Linear Regression on full y_train_regression
+])
 
-# Set up RandomForestRegressor
-rf_reg = RandomForestRegressor(
-    n_estimators=500,          # Number of trees
-    max_depth=6,              # You can tune this
+X_val_stacked = np.hstack([
+    X_val_proc,
+    y_val_pred_lr,
+    y_val_pred_lm2,
+    y_val_pred_lm
+])
+
+# ---------------------------------------------------
+# Meta Model (Final)
+# ---------------------------------------------------
+meta_xgb = XGBRegressor(
+    n_estimators=300,
+    learning_rate=0.05,
+    max_depth=3,
+    subsample=0.8,
+    colsample_bytree=0.7,
+    reg_alpha=0.5,
+    reg_lambda=1.0,
+    gamma=0,
+    objective='reg:squarederror',
     random_state=42,
-    n_jobs=9,
-    max_features=0.75,
-    min_samples_split=2,
-    min_samples_leaf=1
+    n_jobs=-1,
+    verbosity=0
 )
 
-multi_rf_reg = MultiOutputRegressor(rf_reg, n_jobs=1)
-multi_rf_reg.fit(X_train_stacked, y_train_regression)
+# Wrap in MultiOutputRegressor
+meta_model = MultiOutputRegressor(meta_xgb, n_jobs=1)
+meta_model.fit(X_train_stacked, y_train_regression)
 
-# Predict on validation stacked features
-y_val_pred_reg = multi_rf_reg.predict(X_val_stacked)
+# Predict and evaluate
+y_val_pred_meta = meta_model.predict(X_val_stacked)
 
-# Evaluate
 metrics_list = []
-
 for idx, target in enumerate(y_train_regression.columns):
     y_true = y_val_regression.iloc[:, idx]
-    y_pred = y_val_pred_reg[:, idx]
-    rmse = root_mean_squared_error(y_true, y_pred)
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
+    y_pred = y_val_pred_meta[:, idx]
     metrics_list.append({
         'target': target,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2
+        'rmse': root_mean_squared_error(y_true, y_pred),
+        'mae': mean_absolute_error(y_true, y_pred),
+        'r2': r2_score(y_true, y_pred)
     })
 
-regression_metrics_df = pd.DataFrame(metrics_list)
-print(regression_metrics_df)
-regression_metrics_df.to_parquet("evaluation_metrics.parquet", index=False)
+meta_metrics_df = pd.DataFrame(metrics_list)
+print("\nMeta-Model (XGBoost) Evaluation:")
+print(meta_metrics_df)
+meta_metrics_df.to_parquet("evaluation_metrics.parquet", index=False)
 
 # ---------------------------------------------------
 # Save Models and Preprocessor
 # ---------------------------------------------------
-
-joblib.dump(selector, 'variance_threshold_selector.joblib')
 joblib.dump(kmeans_final, 'nba_player_clustering.joblib')
 joblib.dump(preprocessor, "preprocessor_pipeline.joblib")
-joblib.dump(multi_task_lasso, "multi_task_lasso_model.joblib")
-joblib.dump(multi_rf, "multi_rf_classifier_model.joblib")
-joblib.dump(multi_rf_reg, "multi_rf_regressor_model.joblib")
+joblib.dump(multi_lr, 'nba_base_model.joblib')
+joblib.dump(lr_mt, 'nba_secondary_model.joblib')
+joblib.dump(multi_logreg, 'nba_clf_model.joblib')
+joblib.dump(meta_model, 'nba_meta_model.joblib')

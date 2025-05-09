@@ -131,7 +131,7 @@ ui <- tagList(
               div(
                 class = "card-body",
                 h3("Weekly Updates", class = "card-title text-primary"),
-                p("Fresh predictions before every game, with latest data.")
+                p("Fresh predictions before every game, with latest data and scraped over-under odds from FanDuel via Odds API.")
               )
             )
           ),

@@ -47,21 +47,19 @@ This project integrates advanced machine learning, temporal validation, player c
 - Use cluster labels as model features
 
 ### 🔁 Model Stack
-1. **Base Regression:** Linear models for continuous prediction  
-2. **Secondary Regression:** Key contributing stats (e.g., FGA, minutes, team points)  
+1. **Regression Layer:** Linear models for continuous prediction on player box score statistics (including targets and beyond)
 3. **Classification Layer:** Predict binned outcomes via logistic regression  
 4. **Meta Model:** Final prediction via stacked features using `XGBoost`
 
 ### 🧪 Evaluation
-- Metrics: RMSE, MAE, R² (regression), Accuracy, Precision, Recall, F1 (classification)
-- Naive benchmark included (predict mean values)
+- Final Metrics: RMSE, MAE, R², Quantile Loss (regression)
 
 ---
 
 ## 💻 Shiny App: [NBA Prediction Tool](https://jmotta31.shinyapps.io/NBA_Prediction_Tool/)
 
 ### App Features:
-- 📋 **Prediction Table**: View predicted player stats
+- 📋 **Prediction Table**: View predicted player stats with a column selector
 - 🎯 **Betting Edge Tool**: Enter odds to compute implied probabilities and model-based edge
 - 📊 **Evaluation Dashboard**: Displays key performance metrics
 
@@ -82,7 +80,6 @@ This project integrates advanced machine learning, temporal validation, player c
 ```bash
 NBA_Stat_Pred/
 ├── NBA_Stat_Pred.py             # Main model training pipeline
-├── nba_classes.py               # Class used in nba_predictions.py
 ├── nba_predictions.py           # Script for generating new game predictions
 ├── update_nba_data.R            # R script to update datasets
 ├── app.R                        # Shiny App frontend

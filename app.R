@@ -21,6 +21,7 @@ preds_df <- read_parquet("nba_predictions.parquet") %>%
 metrics_df <- read_parquet("evaluation_metrics.parquet")
 # Round MAE to 2 decimals
 metrics_df$mae <- round(metrics_df$mae, 1)
+metrics_df$quantile_loss <- round(metrics_df$quantile_loss, 1)
 
 # Rename 'target' values: replace underscores with spaces and apply title case
 metrics_df$target <- metrics_df$target %>%
@@ -240,6 +241,11 @@ ui <- tagList(
           strong("R‑squared (R²):"),
           "Proportion of variance explained. An R² of 0.5 means we capture about half of the game‑to‑game variability. Shows how much better the model is at predicting compared to simply guessing the average every time."
         ),
+        p(
+          style = "color:#DDDDDD;",
+          strong("Quantile Loss (τ = 0.1):"),
+          "This metric is like an error score that punishes over-predictions more than under-predictions. When τ is 0.1, the model is trained to be cautious—overestimating a player's stats hurts more than underestimating. A lower value means the model is doing a better job staying under expected values, which is especially helpful when avoiding overly optimistic forecasts."
+        ),
         reactableOutput("metrics_table"),
         div(
           style = "text-align:center; margin-top:2rem;",
@@ -354,7 +360,8 @@ server <- function(input, output, session) {
         Metric = colDef(align="left"),
         RMSE   = colDef(format=colFormat(digits=1), align="right"),
         mae    = colDef(name="MAE", format=colFormat(digits=1), align="right"),
-        R2     = colDef(name="R²", format=colFormat(digits=2), align="right")
+        R2     = colDef(name="R²", format=colFormat(digits=2), align="right"),
+        quantile_loss = colDef(name="Quantile Loss", format=colFormat(digits=1), align="right")
       ),
       theme = reactableTheme(
         style    = list(background = "#121212"),

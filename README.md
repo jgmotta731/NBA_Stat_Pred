@@ -35,10 +35,9 @@ This project integrates advanced machine learning, temporal validation, player c
 - Remove DNP and missing targets
 
 ### 🏗️ Feature Engineering
-- Rolling window stats (5 and 20 games): mean, std, z-score, momentum, etc.
-- Trend slope, intercept, and R² via linear regression
-- Opponent- and team-level rolling stats
-- Expanding stats and win/loss streak indicators
+- Exponentially Weighted Moving Average stats (span of 4 and 9): mean, std, z-score, momentum, etc.
+- Trend slope, and R² via linear regression
+- Hot/Cold streak indicators
 - Categorical encoding and missing data flagging
 
 ### 📉 Dimensionality Reduction + Clustering
@@ -48,11 +47,13 @@ This project integrates advanced machine learning, temporal validation, player c
 
 ### 🔁 Model Stack
 1. **Regression Layer:** Linear models for continuous prediction on player box score statistics (including targets and beyond)
-3. **Classification Layer:** Predict binned outcomes via logistic regression  
+2. **Classification Layer:** Predict binned outcomes via logistic regression, then calibrate and add predicted bins and probabilities
+3. **Explosive Game Classification Layer:** Predict whether a player will score more than 30 points or not, then calibrate and add predicted label and probabilities
 4. **Meta Model:** Final prediction via stacked features using `XGBoost`
+5. **Post Hoc Bias Correction:** Final predictions are passed through a set of bias-correction models to reduce systematic over/underestimation in key stats
 
 ### 🧪 Evaluation
-- Final Metrics: RMSE, MAE, R², Quantile Loss (regression)
+- Final Metrics: RMSE, MAE, R², Quantile Loss (Tau=0.1)
 
 ---
 
@@ -87,3 +88,13 @@ NBA_Stat_Pred/
 ├── evaluation_metrics.parquet   # Model metrics, also used for running Shiny app locally
 ├── www/                         # Images used in the app
 └── README.md                    # Project documentation
+```
+## Disclaimer
+
+This project provides predictive models for NBA player performance and is intended for **entertainment and informational purposes only**, including potential use in sports betting contexts.
+
+However, **no prediction is guaranteed**, and betting always carries financial risk. The author makes **no representations or warranties** regarding the accuracy, reliability, or profitability of the models or predictions.
+
+By using this project, you acknowledge that any betting decisions you make are **at your own risk**, and the author is **not liable** for any losses or damages arising from use of this code or its outputs.
+
+Use responsibly and follow all local laws and regulations related to sports wagering.

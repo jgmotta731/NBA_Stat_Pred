@@ -248,7 +248,7 @@ ui <- tagList(
         ),
         reactableOutput("metrics_table"),
         div(
-          style = "text-align:center; margin-top:2rem;",
+          style = "text-align:center; margin-top:2rem; margin-bottom:2rem;",
           tags$img(
             src = "nba_dark.png",
             style = "max-width:420px; height: auto; width:100%;"
@@ -256,6 +256,14 @@ ui <- tagList(
         )
       )
     )
+  ),
+  tags$footer(
+    style = "background-color:#1e1e1e; color:#AAAAAA; text-align:center; padding:1rem; font-size:0.85rem; border-top:1px solid #007AC1;",
+    HTML("
+    <strong>Disclaimer:</strong> This application provides NBA player predictions for entertainment and informational purposes only. 
+    There is no guarantee of accuracy, and no responsibility is assumed for financial losses or decisions made based on this data. 
+    Use responsibly and follow all local laws and regulations related to sports betting.
+  ")
   )
 )
 

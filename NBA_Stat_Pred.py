@@ -18,11 +18,15 @@ from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.metrics import root_mean_squared_error, r2_score, precision_score, f1_score, recall_score, accuracy_score, silhouette_score, mean_absolute_error
+from sklearn.metrics import precision_recall_curve, root_mean_squared_error, r2_score, precision_score, f1_score, recall_score, accuracy_score, silhouette_score, mean_absolute_error, roc_auc_score, confusion_matrix
 from sklearn.multioutput import MultiOutputClassifier, MultiOutputRegressor
 from sklearn.cluster import KMeans
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.model_selection import RandomizedSearchCV
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import RandomForestClassifier
+from scipy.stats import randint, uniform
 from xgboost import XGBRegressor
 
 warnings.filterwarnings("ignore")
@@ -61,7 +65,7 @@ valid_players = player_game_counts[player_game_counts >= 20].index
 gamelogs = gamelogs[gamelogs["athlete_display_name"].isin(valid_players)].copy()
 
 # After filtering players ➔ filter low-minute games
-gamelogs = gamelogs[gamelogs["minutes"] >= 15].reset_index(drop=True)
+gamelogs = gamelogs[gamelogs["minutes"] > 0].reset_index(drop=True)
 
 # Clean up
 del valid_players, player_game_counts
@@ -130,42 +134,9 @@ gamelogs = pd.concat([gamelogs] + lag_results, axis=1)
 def compute_rolling_and_ewm_features(df, col):
     df = df.sort_values(['athlete_display_name', 'game_date'])
     result = pd.DataFrame(index=df.index)
-
-    rolling_windows = [10, 20]
-    ewm_spans = [3, 5, 7, 9]
-
-    # Rolling features
-    for window in rolling_windows:
-        shifted = df.groupby('athlete_display_name')[col].shift(1)
-        shift2 = df.groupby('athlete_display_name')[col].shift(2)
-
-        roll_mean = shifted.groupby(df['athlete_display_name']) \
-                           .rolling(window, min_periods=1).mean() \
-                           .reset_index(level=0, drop=True)
-        roll_std = shifted.groupby(df['athlete_display_name']) \
-                          .rolling(window, min_periods=1).std() \
-                          .reset_index(level=0, drop=True)
-        roll_shift2_mean = shift2.groupby(df['athlete_display_name']) \
-                                 .rolling(window, min_periods=1).mean() \
-                                 .reset_index(level=0, drop=True)
-
-        # Save rolling features
-        result[f'{col}_rolling{window}'] = roll_mean
-        result[f'{col}_rolling_std{window}'] = roll_std
-        result[f'{col}_rolling_zscore{window}'] = (shifted - roll_mean) / (roll_std + 1e-6)
-        result[f'{col}_rolling_momentum{window}'] = shifted - roll_shift2_mean
-
-        # League-wide rolling rank
-        temp_roll = df[['game_date']].copy()
-        temp_roll[f'{col}_rolling_mean{window}'] = roll_mean
-        roll_rank = (
-            temp_roll.groupby('game_date')[f'{col}_rolling_mean{window}']
-                     .transform(lambda x: x.rank(pct=True))
-                     .astype(np.float32)
-        )
-        result[f'{col}_rolling_mean{window}_rank'] = roll_rank
-
+    
     # EWM features
+    ewm_spans = [4, 9]
     for span in ewm_spans:
         shifted = df.groupby('athlete_display_name')[col].shift(1)
         shift2 = df.groupby('athlete_display_name')[col].shift(2)
@@ -201,195 +172,98 @@ rolling_ewm_results = Parallel(n_jobs=-1, backend='loky', verbose=1)(
 # Concatenate all results to original DataFrame
 gamelogs = pd.concat([gamelogs] + rolling_ewm_results, axis=1)
 
-# Trend slope/R² per player
-def compute_trend_stats_for_player(name, group, col, window):
+# Trend slope per player
+def compute_ewm_trend_stats_for_player(name, group, col, span):
     group = group.sort_values('game_date')
     values = group[col].shift(1).to_numpy()
     idx = group.index.to_numpy()
     slopes = np.full(len(values), np.nan, dtype=np.float32)
-    r2_scores = np.full(len(values), np.nan, dtype=np.float32)
-
-    for i in range(window - 1, len(values)):
-        y = values[i - window + 1 : i + 1]
+    
+    # Manually compute exponentially weighted regression
+    for i in range(span - 1, len(values)):
+        y = values[:i + 1]
         x = np.arange(len(y)).reshape(-1, 1)
         mask = ~np.isnan(y)
         if np.count_nonzero(mask) >= 3 and not np.allclose(y[mask], y[mask][0]):
             try:
-                model = LinearRegression().fit(x[mask], y[mask])
-                y_pred = model.predict(x[mask])
+                weights = pd.Series(np.arange(1, len(y) + 1)).ewm(span=span, adjust=False).mean().to_numpy()
+                weights = weights[mask]
+                x_masked = x[mask]
+                y_masked = y[mask]
+                model = LinearRegression()
+                model.fit(x_masked, y_masked, sample_weight=weights)
                 slopes[i] = model.coef_[0]
-                r2_scores[i] = r2_score(y[mask], y_pred)
             except:
                 pass
+    return idx, slopes
 
-    return idx, slopes, r2_scores
-
-for window in [5]:
+for span in [4, 9]:
     for col in targets:
         groups = gamelogs.groupby('athlete_display_name')
         results = Parallel(n_jobs=-1, backend='loky', verbose=1)(
-            delayed(compute_trend_stats_for_player)(name, grp, col, window)
+            delayed(compute_ewm_trend_stats_for_player)(name, grp, col, span)
             for name, grp in groups
         )
         slope_arr = np.full(len(gamelogs), np.nan, dtype=np.float32)
-        r2_arr = np.full(len(gamelogs), np.nan, dtype=np.float32)
 
-        for idxs, slopes, r2s in results:
+        for idxs, slopes in results:
             slope_arr[idxs] = slopes
-            r2_arr[idxs] = r2s
 
-        gamelogs[f'{col}_trend_slope_{window}'] = slope_arr
-        gamelogs[f'{col}_trend_r2_{window}'] = r2_arr
-
-# Team/Opponent rolling stats
-def compute_opponent_team_rolling(df, window):
-    # make sure df is sorted by date for each team/opponent
-    df = df.sort_values('game_date').reset_index(drop=True)
-    result = pd.DataFrame(index=df.index)
-
-    # Team/Opponent basic rolling stats
-    for group_col, stat_col, label in [
-        ("opponent_team_abbreviation","team_score","opponent_points_allowed"),
-        ("opponent_team_abbreviation","three_point_field_goals_made","opponent_3pm_allowed"),
-        ("opponent_team_abbreviation","field_goals_made","opponent_fgm_allowed"),
-        ("opponent_team_abbreviation","rebounds","opponent_rebounds_allowed"),
-        ("opponent_team_abbreviation","free_throws_attempted","opponent_free_throws_allowed"),
-        ("team_abbreviation",         "team_score","team_score"),
-        ("team_abbreviation",         "assists","team_assists"),
-    ]:
-        rolling_mean = (
-            df.groupby(group_col)[stat_col]
-              .transform(lambda x: x.shift(1).rolling(window, min_periods=1).mean())
-              .astype(np.float32)
-        )
-        result[f"{label}_rolling{window}"] = rolling_mean
-
-        # Add league-wide rank for that stat on each game_date
-        temp_df = df[['game_date']].copy()
-        temp_df[f"{label}_rolling{window}"] = rolling_mean
-
-        rolling_rank = (
-            temp_df.groupby('game_date')[f"{label}_rolling{window}"]
-                   .transform(lambda x: x.rank(pct=True))
-                   .astype(np.float32)
-        )
-        result[f"{label}_rolling{window}_rank"] = rolling_rank
-
-    # Derived shooting percentages (no ranks here unless explicitly needed)
-    result[f'fg_pct_rolling{window}'] = (
-        safe_divide(df[f'field_goals_made_rolling{window}'],
-                    df[f'field_goals_attempted_rolling{window}'])
-        .clip(0, 1)
-        .astype(np.float32)
-    )
-    result[f'ft_pct_rolling{window}'] = (
-        safe_divide(df[f'free_throws_made_rolling{window}'],
-                    df[f'free_throws_attempted_rolling{window}'])
-        .clip(0, 1)
-        .astype(np.float32)
-    )
-    result[f'three_pt_pct_rolling{window}'] = (
-        safe_divide(df[f'three_point_field_goals_made_rolling{window}'],
-                    df[f'three_point_field_goals_attempted_rolling{window}'])
-        .clip(0, 1)
-        .astype(np.float32)
-    )
-    result[f'efg_pct_rolling{window}'] = (
-        safe_divide(
-            df[f'field_goals_made_rolling{window}'] +
-            0.5 * df[f'three_point_field_goals_made_rolling{window}'],
-            df[f'field_goals_attempted_rolling{window}']
-        )
-        .clip(0, 1)
-        .astype(np.float32)
-    )
-
-    return result
+        gamelogs[f'{col}_ewm_trend_slope_{span}'] = slope_arr
 
 
-# then call exactly as before:
-team_results = Parallel(n_jobs=-1, backend='loky', verbose=1)(
-    delayed(compute_opponent_team_rolling)(gamelogs, window) for window in [10, 20]
+gamelogs['points_ewm_std_span9'] = (
+    gamelogs
+    .groupby('athlete_display_name')['points']
+    .transform(lambda x: x.shift(1).ewm(span=9, adjust=False).std())
 )
-gamelogs = pd.concat([gamelogs] + team_results, axis=1)
 
-# Expanding features per season
-def compute_expanding_features(df, col):
-    # assumes df is already sorted by ['athlete_display_name','season','game_date']
-    result = pd.DataFrame(index=df.index)
-
-    # season‐level expanding mean & std (shift first to avoid leakage)
-    exp_mean = (
-        df.groupby(['athlete_display_name', 'season'])[col]
-          .transform(lambda x: x.shift(1).expanding().mean())
-          .astype(np.float32)
-    )
-    exp_std = (
-        df.groupby(['athlete_display_name', 'season'])[col]
-          .transform(lambda x: x.shift(1).expanding().std())
-          .astype(np.float32)
-    )
-    zscore = ((df[col].shift(1) - exp_mean) / (exp_std + 1e-6)).astype(np.float32)
-
-    # rolling vs. opponent (5‐game window)
-    roll_vs_opp5 = (
-        df.groupby(['athlete_display_name','opponent_team_abbreviation'])[col]
-          .transform(lambda x: x.shift(1).rolling(5, min_periods=1).mean())
-          .astype(np.float32)
-    )
-
-    # expanding rank (percentile rank of a player's expanding mean vs others on that date)
-    temp_df = df[['season', 'game_date']].copy()
-    temp_df[f'{col}_exp_mean'] = exp_mean
-
-    exp_rank = (
-        temp_df.groupby(['season', 'game_date'])[f'{col}_exp_mean']
-               .transform(lambda x: x.rank(pct=True))
-               .astype(np.float32)
-    )
-
-    # Assign to result
-    result[f'{col}_season_expanding_mean']   = exp_mean
-    result[f'{col}_season_expanding_std']    = exp_std
-    result[f'{col}_season_expanding_zscore'] = zscore
-    result[f'{col}_rolling_vs_opp5']         = roll_vs_opp5
-    result[f'{col}_season_expanding_rank']   = exp_rank
-
-    return result
-
-expanding_results = Parallel(n_jobs=-1, backend='loky', verbose=1)(
-    delayed(compute_expanding_features)(gamelogs, col) for col in rolling_cols
-)
-gamelogs = pd.concat([gamelogs] + expanding_results, axis=1)
-
-# Flag hot games: points > season‐to‐date expanding mean
+# Flag hot games: points >= 1 std dev above EWM mean
 gamelogs['is_hot_game'] = (
-    (gamelogs['points'] > gamelogs['points_season_expanding_mean'])
+    (gamelogs['points'] >= gamelogs['points_ewm_mean_span9'] + gamelogs['points_ewm_std_span9'])
     .fillna(False)
     .astype(int)
 )
 
-# Compute the consecutive “hot” streak length
+# Compute consecutive hot streaks
 gamelogs['hot_streak'] = (
     gamelogs
-    .sort_values(['athlete_display_name','game_date'])
+    .sort_values(['athlete_display_name', 'game_date'])
     .groupby('athlete_display_name')['is_hot_game']
-    .transform(lambda x: 
-        x.shift(1)                        # only prior games
-         .groupby((x.shift(1) != 1).cumsum())  # new run when prior wasn’t hot
-         .cumcount()                      # count within each run
+    .transform(lambda x:
+        x.shift(1)
+         .groupby((x.shift(1) != 1).cumsum())
+         .cumcount()
     )
     .astype(np.int32)
 )
 
+# Flag cold games: points < 1 std dev below EWM mean
+gamelogs['is_cold_game'] = (
+    (gamelogs['points'] < gamelogs['points_ewm_mean_span9'] - gamelogs['points_ewm_std_span9'])
+    .fillna(False)
+    .astype(int)
+)
+
+# Compute consecutive cold streaks
+gamelogs['cold_streak'] = (
+    gamelogs
+    .sort_values(['athlete_display_name', 'game_date'])
+    .groupby('athlete_display_name')['is_cold_game']
+    .transform(lambda x:
+        x.shift(1)
+         .groupby((x.shift(1) != 1).cumsum())
+         .cumcount()
+    )
+    .astype(np.int32)
+)
 # Cleanup
-gamelogs = gamelogs.drop('is_hot_game', axis=1)
+gamelogs = gamelogs.drop(columns=['is_hot_game', 'is_cold_game'], axis=1)
 
 # ---------------------------------------------------
 # Feature Selection
 # ---------------------------------------------------
 gamelogs = gamelogs[gamelogs["season"] >= 2022].copy().reset_index(drop=True)
-gamelogs = gamelogs.drop(columns=[col for col in gamelogs.columns if '_rolling_mean' in col])
 
 gamelogs = gamelogs.drop(columns=[
     'plus_minus', 'ejected', 'did_not_play', 'team_winner', 'active',
@@ -398,8 +272,8 @@ gamelogs = gamelogs.drop(columns=[
 
 lagged_rolling_features = [col for col in gamelogs.columns
                            if 'rolling' in col or 'trend' in col or 'lag' in col 
-                           or 'expanding' in col or 'momentum' in col or 'hot_streak' in col
-                           or 'span' in col]
+                           or 'expanding' in col or 'momentum' in col or 'streak' in col
+                           or 'span' in col or 'ewm' in col]
 
 numeric_features = lagged_rolling_features + ['days_since_last_game']
 categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff"]
@@ -501,7 +375,7 @@ ax2.tick_params(axis='y', labelcolor=color)
 plt.title('Elbow Method + Silhouette Score'); plt.tight_layout(); plt.show()
 
 # Step 7: Final KMeans
-kmeans_final = KMeans(n_clusters=4, random_state=SEED)
+kmeans_final = KMeans(n_clusters=7, random_state=SEED)
 kmeans_final.fit(X_cluster_train)
 
 # Step 8: Assign clusters
@@ -565,7 +439,9 @@ categorical_features = list(dict.fromkeys(categorical_features))
 features = list(dict.fromkeys(features))
 
 train_df = gamelogs[gamelogs["season"] < 2025].copy()
+train_df['explosive_game'] = (train_df['points'] >= 30).astype(int)
 val_df = gamelogs[gamelogs["season"] >= 2025].copy()
+val_df['explosive_game'] = (val_df['points'] >= 30).astype(int)
 
 # Force categorical columns to be string type for compatibility
 for col in categorical_features:
@@ -645,15 +521,15 @@ print(metrics_df)
 # Bin Classification Model
 # ---------------------------------------------------
 bin_edges = {
-    'minutes': [0, 30, np.inf],
-    'field_goals_attempted': [0, 10, np.inf],
-    'field_goals_made': [0, 5, np.inf],
+    'minutes': [0, 32, np.inf],
+    'field_goals_attempted': [0, 12, np.inf],
+    'field_goals_made': [0, 6, np.inf],
     'free_throws_attempted': [0, 3, np.inf],
     'free_throws_made': [0, 2, np.inf],
-    'three_point_field_goals_attempted': [0, 4, np.inf],
+    'three_point_field_goals_attempted': [0, 5, np.inf],
     'points': [0, 15, np.inf],
-    'assists': [0, 3, np.inf],
-    'rebounds': [0, 5, np.inf],
+    'assists': [0, 4, np.inf],
+    'rebounds': [0, 6, np.inf],
     'steals': [0, 1, np.inf],
     'blocks': [0, 1, np.inf],
     'three_point_field_goals_made': [0, 2, np.inf],
@@ -723,41 +599,214 @@ for idx, target in enumerate(y_val_bins.columns):
 metrics_df = pd.DataFrame(metrics_list)
 print(metrics_df)
 
+# Calibrate each base logistic regression model
+calibrated_estimators = []
+
+for i, (target, base_clf) in enumerate(zip(y_train_bins.columns, multi_logreg.estimators_)):
+    calibrated = CalibratedClassifierCV(
+        estimator=base_clf,
+        method='isotonic',
+        cv=3, n_jobs=-1
+    )
+    calibrated.fit(X_train_proc, y_train_bins.iloc[:, i])
+    calibrated_estimators.append(calibrated)
+
+# Use the calibrated models, not the original multi_logreg
+y_train_pred_lr_proba = np.column_stack([
+    clf.predict_proba(X_train_proc)[:, 1]
+    for clf in calibrated_estimators
+])
+
+y_val_pred_lr_proba = np.column_stack([
+    clf.predict_proba(X_val_proc)[:, 1]
+    for clf in calibrated_estimators
+])
+
+# Predicted class labels (bins) for training and validation
+y_train_pred_lr = np.column_stack([
+    clf.predict(X_train_proc) for clf in calibrated_estimators
+])
+
+y_val_pred_lr = np.column_stack([
+    clf.predict(X_val_proc) for clf in calibrated_estimators
+])
+
+metrics = []
+for i, (target, model) in enumerate(zip(y_val_bins.columns, calibrated_estimators)):
+    y_true = y_val_bins.iloc[:, i]
+    y_pred = model.predict(X_val_proc)
+    y_prob = model.predict_proba(X_val_proc)[:, 1]
+
+    metrics.append({
+        'target': target,
+        'accuracy': accuracy_score(y_true, y_pred),
+        'precision': precision_score(y_true, y_pred, zero_division=0),
+        'recall': recall_score(y_true, y_pred, zero_division=0),
+        'f1': f1_score(y_true, y_pred, zero_division=0),
+        'roc_auc': roc_auc_score(y_true, y_prob)
+    })
+
+metrics_df = pd.DataFrame(metrics)
+print(metrics_df)
+
+# ---------------------------------------------------
+# Explosive Game Classification
+# ---------------------------------------------------
+# Define base model
+explosive_base = RandomForestClassifier(
+    class_weight='balanced',
+    random_state=42,
+    n_jobs=-1
+)
+
+# Light tuning grid (around your current values)
+param_dist = {
+    "n_estimators": randint(100, 500),
+    "max_depth": randint(3, 6),
+    "min_samples_leaf": randint(5, 20),
+    "max_features": ["sqrt", "log2", None]
+}
+
+# Run randomized search
+explosive_search = RandomizedSearchCV(
+    estimator=explosive_base,
+    param_distributions=param_dist,
+    n_iter=10,  # light search
+    scoring='f1',
+    cv=3,
+    random_state=42,
+    n_jobs=-1,
+    verbose=1
+)
+
+# Fit
+explosive_search.fit(X_train_proc, train_df["explosive_game"])
+explosive_model = explosive_search.best_estimator_
+print("Best params:", explosive_search.best_params_)
+
+explosive_model.fit(X_train_proc, train_df['explosive_game'])
+
+# Predict on validation set
+y_val_explosive_true = val_df['explosive_game']
+y_val_explosive_pred = explosive_model.predict(X_val_proc)
+y_val_explosive_prob = explosive_model.predict_proba(X_val_proc)[:, 1]
+
+# Evaluate
+explosive_metrics = {
+    'model': type(explosive_model).__name__,
+    'accuracy': accuracy_score(y_val_explosive_true, y_val_explosive_pred),
+    'precision': precision_score(y_val_explosive_true, y_val_explosive_pred, zero_division=0),
+    'recall': recall_score(y_val_explosive_true, y_val_explosive_pred, zero_division=0),
+    'f1': f1_score(y_val_explosive_true, y_val_explosive_pred, zero_division=0),
+    'roc_auc': roc_auc_score(y_val_explosive_true, y_val_explosive_prob),
+    'confusion_matrix': confusion_matrix(y_val_explosive_true, y_val_explosive_pred).tolist()
+}
+
+# Display as DataFrame
+explosive_metrics_df = pd.DataFrame([explosive_metrics])
+print(explosive_metrics_df)
+
+# Wrap the trained explosive_model (don't retrain from scratch)
+calibrated_model = CalibratedClassifierCV(
+    estimator=explosive_model,
+    method='isotonic',  # or 'isotonic'
+    cv=3               # 3-fold internal cross-validation
+)
+
+# Fit calibration on training data
+calibrated_model.fit(X_train_proc, train_df['explosive_game'])
+explosive_probs_calibrated = calibrated_model.predict_proba(X_val_proc)[:, 1]
+
+# Evaluate calibrated predictions
+precision, recall, thresholds = precision_recall_curve(y_val_explosive_true, explosive_probs_calibrated)
+
+y_pred_binary = (explosive_probs_calibrated >= 0.05).astype(int)
+
+# Compute F1 for each threshold
+f1_scores = 2 * (precision * recall) / (precision + recall + 1e-6)
+
+# Find the best threshold
+best_idx = f1_scores.argmax()
+best_thresh = thresholds[best_idx]
+
+print(f"Best threshold: {best_thresh:.4f}")
+print(f"Precision: {precision[best_idx]:.4f}")
+print(f"Recall: {recall[best_idx]:.4f}")
+print(f"F1 Score: {f1_scores[best_idx]:.4f}")
+
+# Probabilities (preferred input for meta-model)
+explosive_train_proba = calibrated_model.predict_proba(X_train_proc)[:, 1]
+explosive_val_proba   = calibrated_model.predict_proba(X_val_proc)[:, 1]
+
+# Predicted Labels
+explosive_train_pred = (explosive_train_proba >= best_thresh).astype(int)
+explosive_val_pred   = (explosive_val_proba >= best_thresh).astype(int)
+
 # ---------------------------------------------------
 # Stack Predictions
 # ---------------------------------------------------
 X_train_stacked = np.hstack([
     X_train_proc,
     y_train_pred_lr,
-    y_train_pred_lm,
+    y_train_pred_lr_proba,
+    explosive_train_pred.reshape(-1, 1),
+    explosive_train_proba.reshape(-1, 1),
+    y_train_pred_lm
 ])
 
 X_val_stacked = np.hstack([
     X_val_proc,
     y_val_pred_lr,
-    y_val_pred_lm,
+    y_val_pred_lr_proba,
+    explosive_val_pred.reshape(-1, 1),
+    explosive_val_proba.reshape(-1, 1),
+    y_val_pred_lm
 ])
 
 # ---------------------------------------------------
 # Meta Model (Final)
 # ---------------------------------------------------
-meta_xgb = XGBRegressor(
-    n_estimators=300,
-    learning_rate=0.05,
-    max_depth=3,
-    subsample=0.8,
-    colsample_bytree=0.4,
-    reg_alpha=1.0,
-    reg_lambda=1.0,
-    gamma=0,
+# Define base model
+base_xgb = XGBRegressor(
     objective='reg:tweedie',
     random_state=42,
-    n_jobs=-1,
+    n_jobs=-1
 )
 
 # Wrap in MultiOutputRegressor
-meta_model = MultiOutputRegressor(meta_xgb, n_jobs=-1)
-meta_model.fit(X_train_stacked, y_train_regression)
+meta_model = MultiOutputRegressor(base_xgb, n_jobs=-1)
+
+# Parameter grid (tight ranges around known good config)
+param_dist = {
+    "estimator__n_estimators": randint(250, 400),
+    "estimator__learning_rate": uniform(0.03, 0.03),         # ~centered at 0.05
+    "estimator__max_depth": randint(3, 5),                   # 3 to 4
+    "estimator__subsample": uniform(0.7, 0.2),               # 0.7 to 0.9
+    "estimator__colsample_bytree": uniform(0.3, 0.4),        # 0.3 to 0.7
+    "estimator__reg_alpha": uniform(0.1, 1.0),               # 0.5 to 1.5
+    "estimator__reg_lambda": uniform(0.1, 1.0),              # 0.5 to 1.5
+    "estimator__gamma": uniform(0, 0.5)                      # 0 to 0.5
+}
+
+# Run RandomizedSearchCV
+tuner = RandomizedSearchCV(
+    estimator=meta_model,
+    param_distributions=param_dist,
+    n_iter=15,
+    scoring='neg_mean_absolute_error',
+    cv=3,
+    random_state=42,
+    n_jobs=-1
+)
+
+# Fit search
+tuner.fit(X_train_stacked, y_train_regression)
+
+# Get the tuned model
+meta_model = tuner.best_estimator_
+
+# Print best params
+print("Best Parameters:\n", tuner.best_params_)
 
 # Predict and evaluate
 y_val_pred_meta = meta_model.predict(X_val_stacked)
@@ -784,6 +833,43 @@ print("\nMeta-Model (XGBoost) Evaluation:")
 print(meta_metrics_df)
 meta_metrics_df.to_parquet("evaluation_metrics.parquet", index=False)
 
+# Store adjusted predictions and coefficients
+y_val_adjusted = pd.DataFrame(index=y_val_regression.index)
+correction_models = {}
+
+for i, target in enumerate(y_val_regression.columns):
+    y_true = y_val_regression[target].values
+    y_pred = y_val_pred_meta[:, i]
+    
+    # Fit linear correction: y_true ~ y_pred
+    bias_model = LinearRegression()
+    bias_model.fit(y_pred.reshape(-1, 1), y_true)
+    
+    # Store adjusted predictions
+    y_val_adjusted[target] = bias_model.predict(y_pred.reshape(-1, 1))
+    correction_models[target] = bias_model
+
+print("\n📊 Post-Hoc Bias Correction Metrics:\n")
+metrics_list = []
+
+for i, target in enumerate(y_val_regression.columns):
+    y_true = y_val_regression[target].values
+    y_pred_raw = y_val_pred_meta[:, i]
+    y_pred_corrected = y_val_adjusted[target].values
+
+    metrics_list.append({
+        "target": target,
+        "mae_raw": mean_absolute_error(y_true, y_pred_raw),
+        "mae_corrected": mean_absolute_error(y_true, y_pred_corrected),
+        "rmse_raw": root_mean_squared_error(y_true, y_pred_raw),
+        "rmse_corrected": root_mean_squared_error(y_true, y_pred_corrected),
+        "r2_raw": r2_score(y_true, y_pred_raw),
+        "r2_corrected": r2_score(y_true, y_pred_corrected)
+    })
+
+metrics_df = pd.DataFrame(metrics_list)
+print(metrics_df.round(4))
+
 df_preds = pd.DataFrame({
     "athlete_display_name": val_df["athlete_display_name"].values,
     "game_date": pd.to_datetime(val_df["game_date"]),
@@ -801,6 +887,65 @@ df_preds = pd.DataFrame({
     "predicted_points": y_val_pred_meta[:, 5]
 })
 
+df_preds_corrected = pd.DataFrame({
+    "athlete_display_name": val_df["athlete_display_name"].values,
+    "game_date": pd.to_datetime(val_df["game_date"]),
+    "three_point_field_goals_made": val_df["three_point_field_goals_made"].values,
+    "predicted_three_point_field_goals_made": y_val_adjusted["three_point_field_goals_made"].values,
+    "rebounds": val_df["rebounds"].values,
+    "predicted_rebounds": y_val_adjusted["rebounds"].values,
+    "assists": val_df["assists"].values,
+    "predicted_assists": y_val_adjusted["assists"].values,
+    "steals": val_df["steals"].values,
+    "predicted_steals": y_val_adjusted["steals"].values,
+    "blocks": val_df["blocks"].values,
+    "predicted_blocks": y_val_adjusted["blocks"].values,
+    "points": val_df["points"].values,
+    "predicted_points": y_val_adjusted["points"].values
+})
+
+import shap
+
+# Base features
+base_feature_names = preprocessor.named_steps['transform'].get_feature_names_out(input_features=features).tolist()
+base_feature_names = [name for i, name in enumerate(base_feature_names)
+                      if preprocessor.named_steps['variance'].get_support()[i]]
+# Stacked model output names
+lr_bin_names      = [f"{t}_logreg_pred" for t in targets2]     # 12
+lr_proba_names    = [f"{t}_logreg_proba" for t in targets2]     # 12
+explosive_names   = ["explosive_pred", "explosive_proba"]       # 2
+lm_pred_names     = [f"{t}_linreg_pred" for t in targets2]      # 12
+
+# Combine in correct stacking order
+stacked_feature_names = (
+    base_feature_names +
+    lr_bin_names +
+    lr_proba_names +
+    explosive_names +
+    lm_pred_names
+)
+
+# Final sanity check
+assert len(stacked_feature_names) == X_train_stacked.shape[1], (
+    f"Feature name misalignment: {len(stacked_feature_names)} names vs {X_train_stacked.shape[1]} columns"
+)
+
+# --- SHAP Summary Plots for Each Target ---
+for i, target in enumerate(y_train_regression.columns):
+    print(f"\n🔍 SHAP Summary Plot for: {target}")
+
+    model = meta_model.estimators_[i]
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_val_stacked)
+
+    shap.summary_plot(
+        shap_values,
+        X_val_stacked,
+        feature_names=stacked_feature_names,
+        max_display=20,
+        show=True
+    )
+
 # ---------------------------------------------------
 # Save Models and Preprocessor
 # ---------------------------------------------------
@@ -809,4 +954,8 @@ joblib.dump(pca_pipeline, 'pca_pipeline.joblib')
 joblib.dump(preprocessor, "preprocessor_pipeline.joblib")
 joblib.dump(lm_mt, 'nba_secondary_model.joblib')
 joblib.dump(multi_logreg, 'nba_clf_model.joblib')
+joblib.dump(calibrated_model, 'calibrated_explosive_model.joblib')
+joblib.dump(calibrated_estimators, 'calibrated_logreg_estimators.joblib')
+joblib.dump(y_train_bins.columns.tolist(), 'calibrated_logreg_target_names.joblib')
 joblib.dump(meta_model, 'nba_meta_model.joblib')
+joblib.dump(correction_models, 'bias_correction_models.pkl')

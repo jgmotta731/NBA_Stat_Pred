@@ -28,6 +28,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestClassifier
 from scipy.stats import randint, uniform
 from xgboost import XGBRegressor
+import shap
 
 warnings.filterwarnings("ignore")
 SEED = 42
@@ -870,23 +871,6 @@ for i, target in enumerate(y_val_regression.columns):
 metrics_df = pd.DataFrame(metrics_list)
 print(metrics_df.round(4))
 
-df_preds = pd.DataFrame({
-    "athlete_display_name": val_df["athlete_display_name"].values,
-    "game_date": pd.to_datetime(val_df["game_date"]),
-    "three_point_field_goals_made": val_df["three_point_field_goals_made"].values,
-    "predicted_three_point_field_goals_made": y_val_pred_meta[:, 0],
-    "rebounds":val_df["rebounds"].values,
-    "predicted_rebounds": y_val_pred_meta[:, 1],
-    "assists": val_df["assists"].values,
-    "predicted_assists": y_val_pred_meta[:, 2],
-    "steals": val_df["steals"].values,
-    "predicted_steals": y_val_pred_meta[:, 3],
-    "blocks": val_df["blocks"].values,
-    "predicted_blocks": y_val_pred_meta[:, 4],
-    "points": val_df["points"].values,
-    "predicted_points": y_val_pred_meta[:, 5]
-})
-
 df_preds_corrected = pd.DataFrame({
     "athlete_display_name": val_df["athlete_display_name"].values,
     "game_date": pd.to_datetime(val_df["game_date"]),
@@ -903,8 +887,6 @@ df_preds_corrected = pd.DataFrame({
     "points": val_df["points"].values,
     "predicted_points": y_val_adjusted["points"].values
 })
-
-import shap
 
 # Base features
 base_feature_names = preprocessor.named_steps['transform'].get_feature_names_out(input_features=features).tolist()

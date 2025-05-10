@@ -89,6 +89,11 @@ NBA_Stat_Pred/
 ├── www/                         # Images used in the app
 └── README.md                    # Project documentation
 ```
+
+## Future Additions
+
+As of now, the model struggles with identifying when a role player or bench player will be given significantly more minutes due to the injury of a starter or star player. An flag indicator of whether a star player or starter is out or won't play will be feature engineered to the training data in the hopes that the model can recognize whether the role player/bench player will be given significantly more minutes and therefore have more points, rebounds, assists, etc.
+
 ## Disclaimer
 
 This project provides predictive models for NBA player performance and is intended for **entertainment and informational purposes only**, including potential use in sports betting contexts.

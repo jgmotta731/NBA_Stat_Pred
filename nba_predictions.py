@@ -110,8 +110,13 @@ gamelogs = gamelogs[gamelogs["athlete_display_name"].isin(valid_players)].copy()
 gamelogs = gamelogs[gamelogs["minutes"] > 0].reset_index(drop=True)
 
 # Ensure game_date is datetime
-# Ensure game_date is datetime
 gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'])
+
+gamelogs = gamelogs.drop(columns='norm')
+dedup_columns=gamelogs.columns.tolist()
+
+# Drop duplicates based on specified columns
+gamelogs = gamelogs.drop_duplicates(subset=dedup_columns).reset_index(drop=True)
 
 # Global temporal sort by player, date, season, and team
 gamelogs = gamelogs.sort_values(['athlete_display_name', 'game_date', 'season', 'team_abbreviation']).reset_index(drop=True)

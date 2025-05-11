@@ -138,6 +138,13 @@ gc.collect()
 # Ensure game_date is datetime
 gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'])
 
+gamelogs = gamelogs.drop(columns='norm')
+dedup_columns=gamelogs.columns.tolist()
+
+# Drop duplicates based on specified columns
+gamelogs = gamelogs.drop_duplicates(subset=dedup_columns).reset_index(drop=True)
+
+
 # Global temporal sort by player, date, season, and team
 gamelogs = gamelogs.sort_values(['athlete_display_name', 'game_date', 'season', 'team_abbreviation']).reset_index(drop=True)
 
@@ -458,7 +465,7 @@ ax2.tick_params(axis='y', labelcolor=color)
 plt.title('Elbow Method + Silhouette Score'); plt.tight_layout(); plt.show()
 
 # Step 7: Final KMeans
-kmeans_final = KMeans(n_clusters=18, random_state=SEED)
+kmeans_final = KMeans(n_clusters=16, random_state=SEED)
 kmeans_final.fit(X_cluster_train)
 
 # Step 8: Assign clusters

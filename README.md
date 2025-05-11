@@ -103,7 +103,18 @@ Use responsibly and follow all local laws and regulations related to sports wage
 
 ## License
 
-This project is **not licensed for public use or redistribution**.  
+This project is not licensed for public use or redistribution.  
 All rights reserved © Jack Motta 2025.
 
-Unauthorized use, copying, or distribution of this code is strictly prohibited.
+The source code in this repository is proprietary.  
+Unauthorized use, copying, or distribution is prohibited.
+
+## Data Sources & Dependencies
+
+This project uses external data and tools under their respective terms and licenses:
+
+- [Odds API](https://the-odds-api.com/) — used under their Terms of Service, solely to filter out players with no available upcoming betting props. No odds data is displayed or redistributed.
+- [StatSurge NBA Injury Database](https://statsurge.substack.com/) — data ownership and licensing remain with the original authors.
+- [HoopR](https://github.com/rtelmore/hoopR) — used under the MIT License.
+
+This project does not redistribute or resell any proprietary data. All rights to external datasets remain with their respective owners.

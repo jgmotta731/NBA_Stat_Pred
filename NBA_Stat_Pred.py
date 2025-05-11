@@ -29,6 +29,7 @@ from sklearn.ensemble import RandomForestClassifier
 from scipy.stats import randint, uniform
 from xgboost import XGBRegressor
 import shap
+import re
 
 warnings.filterwarnings("ignore")
 SEED = 42
@@ -40,6 +41,29 @@ pd.set_option('display.max_columns', 20)
 # ---------------------------------------------------
 # Load & Prepare Data
 # ---------------------------------------------------
+# --- Normalize names ---
+def normalize_name(name):
+    name = name.strip()
+    
+    # Flip name if it's in "Last, First" format
+    if ',' in name:
+        last, first = name.split(',', 1)
+        name = f"{first.strip()} {last.strip()}"
+    
+    # Then clean punctuation and Roman numerals
+    name = re.sub(r'[^\w\s]', '', name)              # remove punctuation
+    name = re.sub(r'\b(?:[IVX]+)$', '', name)        # remove trailing Roman numerals
+    return name.strip()
+
+# Load the 2025 injury data
+injuries_2025 = pd.read_csv('2025_injuries.csv')
+
+# Load the historical injury database
+injury_db = pd.read_csv('Injury Database.csv')
+
+# Vertically concatenate the two datasets (rows from 2025 added to historical)
+injury_db = pd.concat([injury_db, injuries_2025], ignore_index=True)
+
 gamelogs = pd.read_parquet('nba_gamelogs.parquet')
 # downcast numeric types
 gamelogs[gamelogs.select_dtypes('float64').columns] = \
@@ -49,8 +73,44 @@ gamelogs[gamelogs.select_dtypes('int64').columns] = \
     gamelogs.select_dtypes('int64')\
             .apply(pd.to_numeric, downcast='integer')
         
-# Only keep 2021 season onwards
-gamelogs = gamelogs[gamelogs["season"] >= 2021].copy().reset_index(drop=True)
+injury_db['norm'] = injury_db['PLAYER'].apply(normalize_name)
+gamelogs['norm'] = (
+    gamelogs['athlete_display_name']
+        .str.replace(r'[^\w\s]', '', regex=True)
+        .str.replace(r'\b(?:[IVX]+)$', '', regex=True)
+        .str.strip()
+)
+
+# --- Standardize dates ---
+injury_db['DATE'] = pd.to_datetime(injury_db['DATE'], errors='coerce')
+gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'], errors='coerce')
+
+# --- Filter to 2020-2021 season onward ---
+injury_db = injury_db[injury_db['DATE'].dt.year >= 2020].copy()
+gamelogs = gamelogs[gamelogs['season'] >= 2021].copy().reset_index(drop=True)
+
+# --- Identify starters (avg minutes >= 30) ---
+starter_threshold = 30
+starter_avg = gamelogs.groupby('norm')['minutes'].mean()
+starters = set(starter_avg[starter_avg >= starter_threshold].index)
+
+# Step 1: Filter only starter injuries
+starter_injuries = injury_db[injury_db['norm'].isin(starters)].copy()
+
+# Step 2: Merge with gamelogs on team and date
+starter_injuries['starter_injured'] = True
+gamelogs = gamelogs.merge(
+    starter_injuries[['TEAM', 'DATE', 'starter_injured']],
+    left_on=['team_display_name', 'game_date'],
+    right_on=['TEAM', 'DATE'],
+    how='left'
+)
+
+# Step 3: Fill missing with False
+gamelogs['starter_injured'] = gamelogs['starter_injured'].fillna(False)
+
+# Drop merge columns
+gamelogs = gamelogs.drop(columns=['TEAM', 'DATE', 'team_display_name']).reset_index(drop=True)
 
 # Response variables
 targets = ['three_point_field_goals_made', 'rebounds', 'assists', 'steals', 'blocks', 'points']
@@ -92,7 +152,7 @@ if 'plus_minus' in gamelogs.columns:
     )
 
 # Convert booleans to numeric flags
-bool_cols = ['starter', 'ejected', 'team_winner', 'is_playoff']
+bool_cols = ['starter', 'ejected', 'team_winner', 'is_playoff', 'starter_injured']
 for col in bool_cols:
     if col in gamelogs.columns:
         gamelogs[col] = gamelogs[col].fillna(False).astype(np.int32)
@@ -277,7 +337,8 @@ lagged_rolling_features = [col for col in gamelogs.columns
                            or 'span' in col or 'ewm' in col]
 
 numeric_features = lagged_rolling_features + ['days_since_last_game']
-categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff"]
+categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff",
+                        "starter_injured"]
 features = numeric_features + categorical_features
 
 # Add missing flag
@@ -345,15 +406,36 @@ plt.show()
 # Fit PCA Pipeline
 pca_pipeline = Pipeline([
     ('preprocessor', preprocessor),
-    ('pca', PCA(n_components=2, random_state=SEED))
+    ('pca', PCA(n_components=1, random_state=SEED))
 ])
 
 X_cluster_train = pca_pipeline.fit_transform(train_player_summary[numeric_features])
 
+# Extract trained PCA model from pipeline
+pca_model = pca_pipeline.named_steps['pca']
+
+# Get loadings matrix (shape: [n_components, n_features])
+loadings = pca_model.components_
+
+# Get feature names after preprocessing
+feature_names = pca_pipeline.named_steps['preprocessor'].get_feature_names_out(numeric_features)
+
+# Ensure PCA model has at least 10 components (n_components=0.95 may return fewer)
+num_pcs_available = pca_model.components_.shape[0]
+num_pcs_to_show = min(20, num_pcs_available)
+
+# Store and display top 10 loadings per PC
+for i in range(num_pcs_to_show):
+    pc_loadings = pd.Series(loadings[i], index=feature_names, name=f'PC{i+1}_Loading') \
+                    .sort_values(key=abs, ascending=False)
+    
+    print(f"\nTop contributors to PC{i+1}:")
+    print(pc_loadings.head(10))
+    
 # Step 6: Find k clusters on train
 inertias = []
 silhouette_scores = []
-k_values = range(2, 13)
+k_values = range(2, 20)
 
 for k in k_values:
     kmeans = KMeans(n_clusters=k, random_state=SEED)
@@ -376,24 +458,41 @@ ax2.tick_params(axis='y', labelcolor=color)
 plt.title('Elbow Method + Silhouette Score'); plt.tight_layout(); plt.show()
 
 # Step 7: Final KMeans
-kmeans_final = KMeans(n_clusters=7, random_state=SEED)
+kmeans_final = KMeans(n_clusters=18, random_state=SEED)
 kmeans_final.fit(X_cluster_train)
 
 # Step 8: Assign clusters
 train_player_summary['cluster_label'] = kmeans_final.labels_ + 1
 
-# Step 9: Visualize clusters
-pca_2d_df = pd.DataFrame(X_cluster_train, columns=['PC1', 'PC2'])
-pca_2d_df['cluster_label'] = train_player_summary['cluster_label'].values
+# Group by cluster and compute means
+targets2 = ['minutes', 'field_goals_attempted', 'field_goals_made', 
+            'free_throws_attempted', 'free_throws_made',
+            'three_point_field_goals_attempted'] + targets
+ewm_stat_cols = [f"{target}_ewm_mean_span9" for target in targets2]
+cluster_means = (
+    train_player_summary
+    .groupby('cluster_label')[ewm_stat_cols]
+    .mean()
+    .round(2)  # Optional: round for cleaner display
+    .sort_index()
+)
 
-plt.figure(figsize=(10, 7))
-sns.scatterplot(data=pca_2d_df, x='PC1', y='PC2', hue='cluster_label',
-    palette='tab10', s=70, edgecolor='k')
-plt.title('PCA of Player Profiles Colored by Cluster', fontsize=16)
-plt.xlabel('Principal Component 1', fontsize=14)
-plt.ylabel('Principal Component 2', fontsize=14)
-plt.legend(title='Cluster Label', fontsize=12, title_fontsize=13)
-plt.grid(True, linestyle='--', alpha=0.5); plt.tight_layout(); plt.show()
+# Display
+print(cluster_means)
+
+# Assume you have PC1 and cluster_label
+pca_1d_df = pd.DataFrame(X_cluster_train, columns=['PC1'])
+pca_1d_df['cluster_label'] = train_player_summary['cluster_label'].values
+
+plt.figure(figsize=(12, 8))
+sns.stripplot(data=pca_1d_df, x='PC1', hue='cluster_label', palette='tab10', jitter=0.1, size=8, alpha=0.8)
+plt.title('1D PCA Cluster Distribution (PC1)', fontsize=14)
+plt.xlabel('Principal Component 1', fontsize=12)
+plt.yticks([])
+plt.legend(title='Cluster', bbox_to_anchor=(1.01, 1), borderaxespad=0)
+plt.grid(True, axis='x', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
 
 # ---------------------------------------------------
 # Add Cluster Labels to Gamelogs
@@ -518,6 +617,36 @@ for idx, target in enumerate(targets2):
 metrics_df = pd.DataFrame(metrics_list)
 print(metrics_df)
 
+# Feature Coefficients
+try:
+    feature_names = preprocessor.named_steps['transform'].get_feature_names_out()
+except:
+    feature_names = [f"feature_{i}" for i in range(X_train_proc.shape[1])]
+
+# Collect coefficients for each target (linear regression)
+coefs_lr = []
+for i, estimator in enumerate(lm_mt.estimators_):
+    coef = estimator.coef_.flatten()
+    coefs_lr.append(pd.Series(coef, index=feature_names, name=targets2[i]))
+
+# Combine and compute mean absolute coefficient
+coef_df_lr = pd.concat(coefs_lr, axis=1)
+coef_df_lr['mean_abs_coef'] = coef_df_lr.abs().mean(axis=1)
+coef_df_lr_sorted = coef_df_lr.sort_values('mean_abs_coef', ascending=False)
+
+# Plot top N features
+TOP_N = 20
+top_features_lr = coef_df_lr_sorted.head(TOP_N)
+
+plt.figure(figsize=(10, 6))
+top_features_lr['mean_abs_coef'].plot(kind='barh', color='teal')
+plt.gca().invert_yaxis()
+plt.title(f'Top {TOP_N} Features (Linear Regression Avg Coef Magnitude)')
+plt.xlabel('Mean Absolute Coefficient')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
 # ---------------------------------------------------
 # Bin Classification Model
 # ---------------------------------------------------
@@ -599,6 +728,31 @@ for idx, target in enumerate(y_val_bins.columns):
 
 metrics_df = pd.DataFrame(metrics_list)
 print(metrics_df)
+
+# Feature Importance
+# Collect coefficients for each target
+coefs = []
+for i, estimator in enumerate(multi_logreg.estimators_):
+    coef = estimator.coef_.flatten()  # LogisticRegression is binary so shape = (1, n_features)
+    coefs.append(pd.Series(coef, index=feature_names, name=y_train_bins.columns[i]))
+
+# Combine into one DataFrame
+coef_df = pd.concat(coefs, axis=1)
+coef_df['mean_abs_coef'] = coef_df.abs().mean(axis=1)
+coef_df_sorted = coef_df.sort_values('mean_abs_coef', ascending=False)
+
+# Plot top N features
+TOP_N = 20
+top_features = coef_df_sorted.head(TOP_N)
+
+plt.figure(figsize=(10, 6))
+top_features['mean_abs_coef'].plot(kind='barh')
+plt.gca().invert_yaxis()
+plt.title(f'Top {TOP_N} Most Important Features (LogReg Avg Coef Magnitude)')
+plt.xlabel('Mean Absolute Coefficient')
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
 
 # Calibrate each base logistic regression model
 calibrated_estimators = []
@@ -707,6 +861,24 @@ explosive_metrics = {
 explosive_metrics_df = pd.DataFrame([explosive_metrics])
 print(explosive_metrics_df)
 
+# Extract importances
+importances = explosive_model.feature_importances_
+importance_df = pd.Series(importances, index=feature_names, name='Importance')
+importance_df = importance_df.sort_values(ascending=False)
+
+# Plot top N
+TOP_N = 20
+top_features_rf = importance_df.head(TOP_N)
+
+plt.figure(figsize=(10, 6))
+top_features_rf.plot(kind='barh', color='forestgreen')
+plt.gca().invert_yaxis()
+plt.title(f"Top {TOP_N} Most Important Features (Random Forest: Explosive Game Prediction)")
+plt.xlabel("Feature Importance")
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
 # Wrap the trained explosive_model (don't retrain from scratch)
 calibrated_model = CalibratedClassifierCV(
     estimator=explosive_model,
@@ -809,12 +981,11 @@ meta_model = tuner.best_estimator_
 # Print best params
 print("Best Parameters:\n", tuner.best_params_)
 
+from sklearn.metrics import mean_pinball_loss
+
+
 # Predict and evaluate
 y_val_pred_meta = meta_model.predict(X_val_stacked)
-
-def quantile_loss(y_true, y_pred, tau=0.5):
-    error = y_true - y_pred
-    return 2 * np.mean(np.maximum(tau * error, (tau - 1) * error))
 
 # Collect metrics
 metrics_list = []
@@ -826,68 +997,15 @@ for idx, target in enumerate(y_train_regression.columns):
         'rmse': root_mean_squared_error(y_true, y_pred),
         'mae': mean_absolute_error(y_true, y_pred),
         'r2': r2_score(y_true, y_pred),
-        'quantile_loss': quantile_loss(y_true, y_pred, tau=0.1)
+        'quantile_loss_under':  mean_pinball_loss(y_true, y_pred, alpha=0.1),
+        'quantile_loss_over':  mean_pinball_loss(y_true, y_pred, alpha=0.9)
     })
     
 meta_metrics_df = pd.DataFrame(metrics_list)
 print("\nMeta-Model (XGBoost) Evaluation:")
 print(meta_metrics_df)
-meta_metrics_df.to_parquet("evaluation_metrics.parquet", index=False)
 
-# Store adjusted predictions and coefficients
-y_val_adjusted = pd.DataFrame(index=y_val_regression.index)
-correction_models = {}
-
-for i, target in enumerate(y_val_regression.columns):
-    y_true = y_val_regression[target].values
-    y_pred = y_val_pred_meta[:, i]
-    
-    # Fit linear correction: y_true ~ y_pred
-    bias_model = LinearRegression()
-    bias_model.fit(y_pred.reshape(-1, 1), y_true)
-    
-    # Store adjusted predictions
-    y_val_adjusted[target] = bias_model.predict(y_pred.reshape(-1, 1))
-    correction_models[target] = bias_model
-
-print("\n📊 Post-Hoc Bias Correction Metrics:\n")
-metrics_list = []
-
-for i, target in enumerate(y_val_regression.columns):
-    y_true = y_val_regression[target].values
-    y_pred_raw = y_val_pred_meta[:, i]
-    y_pred_corrected = y_val_adjusted[target].values
-
-    metrics_list.append({
-        "target": target,
-        "mae_raw": mean_absolute_error(y_true, y_pred_raw),
-        "mae_corrected": mean_absolute_error(y_true, y_pred_corrected),
-        "rmse_raw": root_mean_squared_error(y_true, y_pred_raw),
-        "rmse_corrected": root_mean_squared_error(y_true, y_pred_corrected),
-        "r2_raw": r2_score(y_true, y_pred_raw),
-        "r2_corrected": r2_score(y_true, y_pred_corrected)
-    })
-
-metrics_df = pd.DataFrame(metrics_list)
-print(metrics_df.round(4))
-
-df_preds_corrected = pd.DataFrame({
-    "athlete_display_name": val_df["athlete_display_name"].values,
-    "game_date": pd.to_datetime(val_df["game_date"]),
-    "three_point_field_goals_made": val_df["three_point_field_goals_made"].values,
-    "predicted_three_point_field_goals_made": y_val_adjusted["three_point_field_goals_made"].values,
-    "rebounds": val_df["rebounds"].values,
-    "predicted_rebounds": y_val_adjusted["rebounds"].values,
-    "assists": val_df["assists"].values,
-    "predicted_assists": y_val_adjusted["assists"].values,
-    "steals": val_df["steals"].values,
-    "predicted_steals": y_val_adjusted["steals"].values,
-    "blocks": val_df["blocks"].values,
-    "predicted_blocks": y_val_adjusted["blocks"].values,
-    "points": val_df["points"].values,
-    "predicted_points": y_val_adjusted["points"].values
-})
-
+# Meta Model Feature Importance
 # Base features
 base_feature_names = preprocessor.named_steps['transform'].get_feature_names_out(input_features=features).tolist()
 base_feature_names = [name for i, name in enumerate(base_feature_names)
@@ -927,6 +1045,62 @@ for i, target in enumerate(y_train_regression.columns):
         max_display=20,
         show=True
     )
+
+# ---------------------------------------------------
+# Post-Hoc Bias Corrections
+# ---------------------------------------------------
+
+# Store adjusted predictions and coefficients
+y_val_adjusted = pd.DataFrame(index=y_val_regression.index)
+correction_models = {}
+
+for i, target in enumerate(y_val_regression.columns):
+    y_true = y_val_regression[target].values
+    y_pred = y_val_pred_meta[:, i]
+    
+    # Fit linear correction: y_true ~ y_pred
+    bias_model = LinearRegression()
+    bias_model.fit(y_pred.reshape(-1, 1), y_true)
+    
+    # Store adjusted predictions
+    y_val_adjusted[target] = bias_model.predict(y_pred.reshape(-1, 1))
+    correction_models[target] = bias_model
+
+print("\n📊 Post-Hoc Bias Correction Metrics:\n")
+metrics_list = []
+for i, target in enumerate(y_val_regression.columns):
+    y_true = y_val_regression[target].values
+    y_pred_corrected = y_val_adjusted[target].values
+    metrics_list.append({
+        "target": target,
+        "mae": mean_absolute_error(y_true, y_pred_corrected),
+        "rmse": root_mean_squared_error(y_true, y_pred_corrected),
+        "r2": r2_score(y_true, y_pred_corrected),
+        "quantile_loss_under":  mean_pinball_loss(y_true, y_pred, alpha=0.1),
+        "quantile_loss_over":  mean_pinball_loss(y_true, y_pred, alpha=0.9)
+    })
+
+metrics_df = pd.DataFrame(metrics_list)
+print(metrics_df.round(4))
+metrics_df.to_parquet("evaluation_metrics.parquet", index=False)
+
+
+df_preds_corrected = pd.DataFrame({
+    "athlete_display_name": val_df["athlete_display_name"].values,
+    "game_date": pd.to_datetime(val_df["game_date"]),
+    "three_point_field_goals_made": val_df["three_point_field_goals_made"].values,
+    "predicted_three_point_field_goals_made": y_val_adjusted["three_point_field_goals_made"].values,
+    "rebounds": val_df["rebounds"].values,
+    "predicted_rebounds": y_val_adjusted["rebounds"].values,
+    "assists": val_df["assists"].values,
+    "predicted_assists": y_val_adjusted["assists"].values,
+    "steals": val_df["steals"].values,
+    "predicted_steals": y_val_adjusted["steals"].values,
+    "blocks": val_df["blocks"].values,
+    "predicted_blocks": y_val_adjusted["blocks"].values,
+    "points": val_df["points"].values,
+    "predicted_points": y_val_adjusted["points"].values
+})
 
 # ---------------------------------------------------
 # Save Models and Preprocessor

@@ -15,7 +15,7 @@ player_raw <- load_nba_player_box(
          -opponent_team_name, -opponent_team_location,
          -opponent_team_display_name, -opponent_team_logo,
          -opponent_team_color, -opponent_team_alternate_color,
-         -reason, -team_display_name)
+         -reason)
 
 schedule <- load_nba_schedule(as.numeric(format(Sys.Date(), "%Y"))) %>%
   select(home_abbreviation, away_abbreviation, game_date, season_type) %>%

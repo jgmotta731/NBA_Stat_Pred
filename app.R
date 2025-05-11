@@ -19,9 +19,6 @@ preds_df <- read_parquet("nba_predictions.parquet") %>%
   arrange(game_date, team_abbreviation, athlete_display_name)
 
 metrics_df <- read_parquet("evaluation_metrics.parquet")
-# Round MAE to 2 decimals
-metrics_df$mae <- round(metrics_df$mae, 1)
-metrics_df$quantile_loss <- round(metrics_df$quantile_loss, 1)
 
 # Rename 'target' values: replace underscores with spaces and apply title case
 metrics_df$target <- metrics_df$target %>%
@@ -188,14 +185,7 @@ ui <- tagList(
                   label = NULL,
                   choices = c(
                     "Player", "Team", "Opponent", "Date", "HomeAway",
-                    "3‑Point FG", "Rebounds", "Assists", "Steals", "Blocks", "Points",
-                    "Over Threes - Price", "Over Threes - Point", "Under Threes - Price", "Under Threes - Point",
-                    "Over Rebounds - Price", "Over Rebounds - Point", "Under Rebounds - Price", "Under Rebounds - Point",
-                    "Over Assists - Price", "Over Assists - Point", "Under Assists - Price", "Under Assists - Point",
-                    "Over Steals - Price", "Over Steals - Point", "Under Steals - Price", "Under Steals - Point",
-                    "Over Blocks - Price", "Over Blocks - Point", "Under Blocks - Price", "Under Blocks - Point",
-                    "Over Points - Price", "Over Points - Point", "Under Points - Price", "Under Points - Point"
-                  ),
+                    "3‑Point FG", "Rebounds", "Assists", "Steals", "Blocks", "Points"),
                   selected = c(
                     "Player", "Team", "Opponent", "Date", "HomeAway",
                     "3‑Point FG", "Rebounds", "Assists", "Steals", "Blocks", "Points"
@@ -243,8 +233,13 @@ ui <- tagList(
         ),
         p(
           style = "color:#DDDDDD;",
-          strong("Quantile Loss (τ = 0.1):"),
-          "This metric is like an error score that punishes over-predictions more than under-predictions. When τ is 0.1, the model is trained to be cautious—overestimating a player's stats hurts more than underestimating. A lower value means the model is doing a better job staying under expected values, which is especially helpful when avoiding overly optimistic forecasts."
+          strong("Pinball Loss (τ = 0.1):"),
+          "Measures how well the model predicts the 10th percentile. A lower value means the model is effectively avoiding over-predictions, making it useful for conservative forecasting."
+        ),
+        p(
+          style = "color:#DDDDDD;",
+          strong("Pinball Loss (τ = 0.9):"),
+          "Measures how well the model predicts the 90th percentile. A lower value here means the model is good at avoiding under-predictions, useful for capturing upper-bound expectations."
         ),
         reactableOutput("metrics_table"),
         div(
@@ -365,11 +360,12 @@ server <- function(input, output, session) {
       highlight = TRUE,
       compact = TRUE,
       columns = list(
-        Metric = colDef(align="left"),
+        Metric = colDef(name="Target", align="left"),
         RMSE   = colDef(format=colFormat(digits=1), align="right"),
         mae    = colDef(name="MAE", format=colFormat(digits=1), align="right"),
         R2     = colDef(name="R²", format=colFormat(digits=2), align="right"),
-        quantile_loss = colDef(name="Quantile Loss", format=colFormat(digits=1), align="right")
+        quantile_loss_under = colDef(name="Pinball Loss (Tau=0.1)", format=colFormat(digits=1), align="right"),
+        quantile_loss_over = colDef(name="Pinball Loss (Tau=0.9)", format=colFormat(digits=1), align="right")
       ),
       theme = reactableTheme(
         style    = list(background = "#121212"),

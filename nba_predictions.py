@@ -11,13 +11,37 @@ from nba_api.stats.static import players
 from sklearn.linear_model import LinearRegression
 from datetime import date, timedelta
 from unidecode import unidecode
+import re
 
 warnings.filterwarnings("ignore")
 
-# Load, instantiate, and generate predictions
+# Load gamelogs, upcoming schedule, injury database, and betting odds
 gamelogs = pd.read_parquet("nba_gamelogs.parquet")
 schedule = pd.read_parquet("nba_schedule.parquet")
 betting_odds_df = pd.read_csv("NBA_Betting_Odds.csv")
+
+# --- Normalize names ---
+def normalize_name(name):
+    name = name.strip()
+    
+    # Flip name if it's in "Last, First" format
+    if ',' in name:
+        last, first = name.split(',', 1)
+        name = f"{first.strip()} {last.strip()}"
+    
+    # Then clean punctuation and Roman numerals
+    name = re.sub(r'[^\w\s]', '', name)              # remove punctuation
+    name = re.sub(r'\b(?:[IVX]+)$', '', name)        # remove trailing Roman numerals
+    return name.strip()
+
+# Load the 2025 injury data
+injuries_2025 = pd.read_csv('2025_injuries.csv')
+
+# Load the historical injury database
+injury_db = pd.read_csv('Injury Database.csv')
+
+# Vertically concatenate the two datasets (rows from 2025 added to historical)
+injury_db = pd.concat([injury_db, injuries_2025], ignore_index=True)
 
 # downcast numeric types
 gamelogs[gamelogs.select_dtypes('float64').columns] = \
@@ -26,7 +50,46 @@ gamelogs[gamelogs.select_dtypes('float64').columns] = \
 gamelogs[gamelogs.select_dtypes('int64').columns] = \
     gamelogs.select_dtypes('int64')\
             .apply(pd.to_numeric, downcast='integer')
-        
+
+injury_db['norm'] = injury_db['PLAYER'].apply(normalize_name)
+gamelogs['norm'] = (
+    gamelogs['athlete_display_name']
+        .str.replace(r'[^\w\s]', '', regex=True)
+        .str.replace(r'\b(?:[IVX]+)$', '', regex=True)
+        .str.strip()
+)
+
+# --- Standardize dates ---
+injury_db['DATE'] = pd.to_datetime(injury_db['DATE'], errors='coerce')
+gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'], errors='coerce')
+
+# --- Filter to 2020-2021 season onward ---
+injury_db = injury_db[injury_db['DATE'].dt.year >= 2020].copy()
+gamelogs = gamelogs[gamelogs['season'] >= 2021].copy().reset_index(drop=True)
+
+# --- Identify starters (avg minutes >= 30) ---
+starter_threshold = 30
+starter_avg = gamelogs.groupby('norm')['minutes'].mean()
+starters = set(starter_avg[starter_avg >= starter_threshold].index)
+
+# Step 1: Filter only starter injuries
+starter_injuries = injury_db[injury_db['norm'].isin(starters)].copy()
+
+# Step 2: Merge with gamelogs on team and date
+starter_injuries['starter_injured'] = True
+gamelogs = gamelogs.merge(
+    starter_injuries[['TEAM', 'DATE', 'starter_injured']],
+    left_on=['team_display_name', 'game_date'],
+    right_on=['TEAM', 'DATE'],
+    how='left'
+)
+
+# Step 3: Fill missing with False
+gamelogs['starter_injured'] = gamelogs['starter_injured'].fillna(False)
+
+# Drop merge columns
+gamelogs = gamelogs.drop(columns=['TEAM', 'DATE', 'team_display_name']).reset_index(drop=True)
+
 # Only keep 2022 season onwards
 gamelogs = gamelogs[gamelogs["season"] >= 2021].copy().reset_index(drop=True)
 
@@ -64,7 +127,7 @@ if 'plus_minus' in gamelogs.columns:
     )
 
 # Convert booleans to numeric flags
-bool_cols = ['starter', 'ejected', 'team_winner', 'is_playoff']
+bool_cols = ['starter', 'ejected', 'team_winner', 'is_playoff', 'starter_injured']
 for col in bool_cols:
     if col in gamelogs.columns:
         gamelogs[col] = gamelogs[col].fillna(False).astype(np.int32)
@@ -248,7 +311,7 @@ lagged_rolling_features = [col for col in gamelogs.columns
                            or 'span' in col or 'ewm' in col]
 
 numeric_features = lagged_rolling_features + ['days_since_last_game']
-categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff"]
+categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff", "starter_injured"]
 features = numeric_features + categorical_features
 
 # Add missing flag
@@ -412,7 +475,7 @@ pivot = pivot[cols]
 # create normalized join‐key for df
 df['norm'] = (
     df['athlete_display_name']
-      .str.replace(r'[^\w\s]', '', regex=True)                   # remove punctuation
+      .str.replace(r'[^\w\s]', '', regex=True)                  # remove punctuation
       .str.replace(r'\b(?:[IVX]+)$', '', regex=True)            # remove Roman numerals at end
       .str.strip()
 )
@@ -425,7 +488,7 @@ pivot['player_name'] = (
          .str.strip()
 )
 
-# merge df with pivot (using pivot, not pivot_df)
+# merge df with pivot
 out = df.merge(
     pivot,
     left_on='norm',
@@ -433,6 +496,16 @@ out = df.merge(
     how='inner'
 ).drop(columns=['player_name','norm'])
 
-# now out contains athlete_display_name plus all your pivot columns
+# Define the list of columns to keep
+columns_to_keep = [
+    'athlete_display_name', 'athlete_position_abbreviation',
+    'team_abbreviation', 'opponent_team_abbreviation', 'game_date',
+    'home_away', 'predicted_three_point_field_goals_made',
+    'predicted_rebounds', 'predicted_assists', 'predicted_steals',
+    'predicted_blocks', 'predicted_points', 'headshot_url'
+]
+
+# Subset the DataFrame
+out = out[columns_to_keep].copy()
 out.to_parquet("nba_predictions.parquet", index=False)
 print("Saved nba_predictions.parquet")

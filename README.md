@@ -30,30 +30,31 @@ This project integrates advanced machine learning, temporal validation, player c
 
 ### 🔧 Data Processing
 - NBA gamelogs from 2022 onward (`.parquet` format)
-- Filter players with ≥20 games and ≥15 minutes per game
+- Filter players with ≥20 games and > 0 minutes per game
 - Downcasting types for memory efficiency
 - Remove DNP and missing targets
 
 ### 🏗️ Feature Engineering
 - Exponentially Weighted Moving Average stats (span of 4 and 9): mean, std, z-score, momentum, etc.
+- Whether a player's starter teammate is injured coming into the game via StatSurge NBA Injury Database
 - Trend slope, and R² via linear regression
 - Hot/Cold streak indicators
 - Categorical encoding and missing data flagging
 
 ### 📉 Dimensionality Reduction + Clustering
 - Apply PCA on player-season summaries
-- KMeans clustering (optimal K=3 via elbow + silhouette)
+- K-Means clustering
 - Use cluster labels as model features
 
 ### 🔁 Model Stack
-1. **Regression Layer:** Linear models for continuous prediction on player box score statistics (including targets and beyond)
-2. **Classification Layer:** Predict binned outcomes via logistic regression, then calibrate and add predicted bins and probabilities
+1. **Regression Layer:** Linear models for continuous prediction on player box score statistics
+2. **Classification Layer:** Predict binned outcomes, then calibrate and add predicted bins and probabilities
 3. **Explosive Game Classification Layer:** Predict whether a player will score more than 30 points or not, then calibrate and add predicted label and probabilities
-4. **Meta Model:** Final prediction via stacked features using `XGBoost`
+4. **Meta Model:** Final prediction via stacked features
 5. **Post Hoc Bias Correction:** Final predictions are passed through a set of bias-correction models to reduce systematic over/underestimation in key stats
 
 ### 🧪 Evaluation
-- Final Metrics: RMSE, MAE, R², Quantile Loss (Tau=0.1)
+- Final Metrics: RMSE, MAE, R², Pinball Loss (α=0.1 and α=0.9)
 
 ---
 
@@ -82,17 +83,13 @@ This project integrates advanced machine learning, temporal validation, player c
 NBA_Stat_Pred/
 ├── NBA_Stat_Pred.py             # Main model training pipeline
 ├── nba_predictions.py           # Script for generating new game predictions
-├── update_nba_data.R            # R script to update datasets
+├── update_nba_data.R            # R script to update gamelogs and game schedule
 ├── app.R                        # Shiny App frontend
 ├── nba_predictions.parquet      # Generated predictions for upcoming games, used for running the app locally
 ├── evaluation_metrics.parquet   # Model metrics, also used for running Shiny app locally
 ├── www/                         # Images used in the app
 └── README.md                    # Project documentation
 ```
-
-## Future Additions
-
-As of now, the model struggles with identifying when a role player or bench player will be given significantly more minutes due to the injury of a starter or star player. An flag indicator of whether a star player or starter is out or won't play will be feature engineered to the training data in the hopes that the model can recognize whether the role player/bench player will be given significantly more minutes and therefore have more points, rebounds, assists, etc.
 
 ## Disclaimer
 
@@ -103,3 +100,10 @@ However, **no prediction is guaranteed**, and betting always carries financial r
 By using this project, you acknowledge that any betting decisions you make are **at your own risk**, and the author is **not liable** for any losses or damages arising from use of this code or its outputs.
 
 Use responsibly and follow all local laws and regulations related to sports wagering.
+
+## License
+
+This project is **not licensed for public use or redistribution**.  
+All rights reserved © Jack Motta 2025.
+
+Unauthorized use, copying, or distribution of this code is strictly prohibited.

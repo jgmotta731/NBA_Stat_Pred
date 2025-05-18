@@ -586,7 +586,7 @@ except Exception as e:
 # ---------------------------------------------------
 # Scraping Odds
 # ---------------------------------------------------
-API_KEY = '4d687f31fa6a19e0c3609594ee620698'
+API_KEY = 'api_key'
 SPORT = 'basketball_nba'
 REGION = 'us'
 BOOKMAKER = 'draftkings'

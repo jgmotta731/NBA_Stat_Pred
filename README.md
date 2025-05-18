@@ -85,8 +85,6 @@ NBA_Stat_Pred/
 ├── nba_predictions.py           # Script for generating new game predictions
 ├── update_nba_data.R            # R script to update gamelogs and game schedule
 ├── app.R                        # Shiny App frontend
-├── nba_predictions.parquet      # Generated predictions for upcoming games, used for running the app locally
-├── evaluation_metrics.parquet   # Model metrics, also used for running Shiny app locally
 ├── www/                         # Images used in the app
 └── README.md                    # Project documentation
 ```

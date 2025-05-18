@@ -12,13 +12,15 @@ from sklearn.linear_model import LinearRegression
 from datetime import date, timedelta
 from unidecode import unidecode
 import re
+import requests
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
 # Load gamelogs, upcoming schedule, injury database, and betting odds
 gamelogs = pd.read_parquet("nba_gamelogs.parquet")
 schedule = pd.read_parquet("nba_schedule.parquet")
-betting_odds_df = pd.read_csv("NBA_Betting_Odds.csv")
+hoopr_odds = pd.read_parquet('hoopr_game_odds.parquet')
 
 # --- Normalize names ---
 def normalize_name(name):
@@ -107,21 +109,79 @@ valid_players = player_game_counts[player_game_counts >= 20].index
 gamelogs = gamelogs[gamelogs["athlete_display_name"].isin(valid_players)].copy()
 
 # After filtering players ➔ filter low-minute games
-gamelogs = gamelogs[gamelogs["minutes"] > 0].reset_index(drop=True)
+gamelogs = gamelogs[gamelogs["did_not_play"] == False].reset_index(drop=True)
+
+# Ensure team_abbreviation and opponent_team_abbreviation are uppercase
+gamelogs['team_abbreviation'] = gamelogs['team_abbreviation'].str.upper()
+gamelogs['opponent_team_abbreviation'] = gamelogs['opponent_team_abbreviation'].str.upper()
+
+# Make home and away columns based on home_away flag
+gamelogs['home'] = gamelogs.apply(
+    lambda row: row['team_abbreviation'] if row['home_away'].lower() == 'home' else row['opponent_team_abbreviation'],
+    axis=1
+)
+
+gamelogs['away'] = gamelogs.apply(
+    lambda row: row['team_abbreviation'] if row['home_away'].lower() == 'away' else row['opponent_team_abbreviation'],
+    axis=1
+)
+
+# Ensure date columns are datetime for join
+hoopr_odds['game_date'] = pd.to_datetime(hoopr_odds['game_date'])
+
+# Ensure uppercase consistency
+hoopr_odds['home_team'] = hoopr_odds['home_team'].str.upper()
+hoopr_odds['away_team'] = hoopr_odds['away_team'].str.upper()
+
+# Ensure date formats are aligned
+hoopr_odds['game_date'] = pd.to_datetime(hoopr_odds['game_date'])
+
+# Left join on HoopR odds data from play-by-play data
+gamelogs = gamelogs.merge(
+    hoopr_odds,
+    how='left',
+    left_on=['game_date', 'home', 'away', 'season'],
+    right_on=['game_date', 'home_team', 'away_team', 'season'],
+    suffixes=('', '_hoopr')  # optional: avoid column collisions
+)
+
+# Drop temporary columns
+gamelogs = gamelogs.drop(columns=['game_id_hoopr', 'home_team', 'away_team', 'home', 'away', 'norm'])
+
+# Downcast float64 to float32
+gamelogs['game_spread'] = gamelogs['game_spread'].astype(np.float32)
+gamelogs['home_team_spread'] = gamelogs['home_team_spread'].astype(np.float32)
+
+# Clean up
+del hoopr_odds, injury_db, injuries_2025, starter_avg, starter_injuries, starter_threshold, starters, valid_players, player_game_counts
+
+# ---------------------------------------------------
+# Feature Engineering
+# ---------------------------------------------------
+# Define tqdm-parallel wrapper to track progress in joblib Parallel
+class TqdmParallel(Parallel):
+    def __init__(self, total=None, *args, **kwargs):
+        self._total = total
+        self._pbar = tqdm(total=total)
+        super().__init__(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        with self._pbar:
+            return Parallel.__call__(self, *args, **kwargs)
+
+    def print_progress(self):
+        self._pbar.update(self.n_completed_tasks - self._pbar.n)
 
 # Ensure game_date is datetime
 gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'])
 
-gamelogs = gamelogs.drop(columns='norm')
-dedup_columns=gamelogs.columns.tolist()
+# Drop duplicates
+gamelogs = gamelogs.drop_duplicates().reset_index(drop=True)
 
-# Drop duplicates based on specified columns
-gamelogs = gamelogs.drop_duplicates(subset=dedup_columns).reset_index(drop=True)
-
-# Global temporal sort by player, date, season, and team
+# Global temporal sort
 gamelogs = gamelogs.sort_values(['athlete_display_name', 'game_date', 'season', 'team_abbreviation']).reset_index(drop=True)
 
-# Clean up plus_minus column
+# Clean plus_minus
 if 'plus_minus' in gamelogs.columns:
     gamelogs['plus_minus'] = (
         gamelogs['plus_minus']
@@ -131,96 +191,86 @@ if 'plus_minus' in gamelogs.columns:
         .astype(np.float32)
     )
 
-# Convert booleans to numeric flags
-bool_cols = ['starter', 'ejected', 'team_winner', 'is_playoff', 'starter_injured']
+# Booleans to numeric
+bool_cols = ['starter', 'ejected', 'team_winner', 'is_playoff', 'starter_injured', 'home_favorite']
 for col in bool_cols:
     if col in gamelogs.columns:
         gamelogs[col] = gamelogs[col].fillna(False).astype(np.int32)
 
-# Create Playoff Indicator
+# Playoff indicator
 gamelogs['is_playoff'] = gamelogs['season_type'].isin([3, 5]).astype(np.int32)
 
-# Compute days since last game per player
-gamelogs['days_since_last_game'] = (
-    gamelogs.groupby('athlete_display_name')['game_date']
-    .diff()
-    .dt.days
-    .astype(np.float32)
-)
+# Days since last game
+gamelogs['days_since_last_game'] = gamelogs.groupby(['athlete_display_name', 'season'])['game_date'].diff().dt.days.astype(np.float32)
 
-# Safe division helper
-def safe_divide(numerator, denominator, eps=1e-3):
-    return numerator / (denominator + eps)
+# Back-to-back
+gamelogs['is_back_to_back'] = (gamelogs['days_since_last_game'].fillna(99) == 1).astype(np.int32)
 
-# Define rolling columns
-rolling_cols = [
-    'field_goals_made', 'field_goals_attempted', 'three_point_field_goals_made',
-    'three_point_field_goals_attempted', 'free_throws_made', 'free_throws_attempted',
-    'rebounds', 'assists', 'steals', 'blocks','points', 'minutes'
-]
+# Rolling columns
+rolling_cols = ['field_goals_made', 'field_goals_attempted', 'three_point_field_goals_made',
+                'three_point_field_goals_attempted', 'free_throws_made', 'free_throws_attempted',
+                'rebounds', 'assists', 'steals', 'blocks', 'points', 'minutes']
 
+# Lag features
 def compute_lag_features(df, col):
     df = df.sort_values(['athlete_display_name', 'game_date'])
     result = pd.DataFrame(index=df.index)
-
-    # Lags
-    result[f'{col}_lag1'] = df.groupby('athlete_display_name')[col].shift(1)
-    result[f'{col}_lag2'] = df.groupby('athlete_display_name')[col].shift(2)
-
+    result[f'{col}_lag1'] = df.groupby(['athlete_display_name', 'season'])[col].shift(1)
+    result[f'{col}_lag2'] = df.groupby(['athlete_display_name', 'season'])[col].shift(2)
+    result[f'{col}_lag3'] = df.groupby(['athlete_display_name', 'season'])[col].shift(3)
     return result
-lag_results = Parallel(n_jobs=-1, backend='loky', verbose=1)(delayed(compute_lag_features)(gamelogs, col) for col in rolling_cols)
+
+lag_results = TqdmParallel(n_jobs=-1, total=len(rolling_cols))(
+    delayed(compute_lag_features)(gamelogs, col) for col in rolling_cols
+)
 gamelogs = pd.concat([gamelogs] + lag_results, axis=1)
 
-# Rolling features per player
+# Expanding means
+def compute_expanding_mean(df, col):
+    df = df.sort_values(['athlete_display_name', 'game_date'])
+    result = pd.DataFrame(index=df.index)
+    result[f'{col}_expanding_mean'] = (
+        df.groupby(['athlete_display_name', 'season'])[col]
+        .transform(lambda x: x.shift(1).expanding().mean())
+    )
+    return result
+
+expanding_results = TqdmParallel(n_jobs=-1, total=len(rolling_cols))(
+    delayed(compute_expanding_mean)(gamelogs, col) for col in rolling_cols
+)
+gamelogs = pd.concat([gamelogs] + expanding_results, axis=1)
+
+# Rolling EWM, momentum, z-score, rank
 def compute_rolling_and_ewm_features(df, col):
     df = df.sort_values(['athlete_display_name', 'game_date'])
     result = pd.DataFrame(index=df.index)
-    
-    # EWM features
-    ewm_spans = [4, 9]
+    ewm_spans = [5, 9, 19]
     for span in ewm_spans:
-        shifted = df.groupby('athlete_display_name')[col].shift(1)
-        shift2 = df.groupby('athlete_display_name')[col].shift(2)
-
-        ewm_mean = shifted.groupby(df['athlete_display_name']) \
-                          .ewm(span=span, adjust=False).mean() \
-                          .reset_index(level=0, drop=True)
-        ewm_shift2_mean = shift2.groupby(df['athlete_display_name']) \
-                                .ewm(span=span, adjust=False).mean() \
-                                .reset_index(level=0, drop=True)
-
+        shifted = df.groupby(['athlete_display_name', 'season'])[col].shift(1)
+        shift2 = df.groupby(['athlete_display_name', 'season'])[col].shift(2)
+        ewm_mean = shifted.groupby([df['athlete_display_name'], df['season']]) \
+                          .ewm(span=span, adjust=False).mean().reset_index(level=[0,1], drop=True)
+        ewm_shift2_mean = shift2.groupby([df['athlete_display_name'], df['season']]) \
+                                .ewm(span=span, adjust=False).mean().reset_index(level=[0,1], drop=True)
         result[f'{col}_ewm_mean_span{span}'] = ewm_mean
         result[f'{col}_ewm_momentum_span{span}'] = shifted - ewm_shift2_mean
         result[f'{col}_ewm_zscore_span{span}'] = (shifted - ewm_mean) / (ewm_mean.std() + 1e-6)
-
-        # League-wide EWM rank
         temp_ewm = df[['game_date']].copy()
         temp_ewm[f'{col}_ewm_mean_span{span}'] = ewm_mean
-        ewm_rank = (
-            temp_ewm.groupby('game_date')[f'{col}_ewm_mean_span{span}']
-                    .transform(lambda x: x.rank(pct=True))
-                    .astype(np.float32)
-        )
-        result[f'{col}_ewm_mean_span{span}_rank'] = ewm_rank
-
+        result[f'{col}_ewm_mean_span{span}_rank'] = temp_ewm.groupby('game_date')[f'{col}_ewm_mean_span{span}'].transform(lambda x: x.rank(pct=True)).astype(np.float32)
     return result
 
-# Compute features in parallel
-rolling_ewm_results = Parallel(n_jobs=-1, backend='loky', verbose=1)(
+rolling_ewm_results = TqdmParallel(n_jobs=-1, total=len(rolling_cols))(
     delayed(compute_rolling_and_ewm_features)(gamelogs, col) for col in rolling_cols
 )
-
-# Concatenate all results to original DataFrame
 gamelogs = pd.concat([gamelogs] + rolling_ewm_results, axis=1)
 
-# Trend slope per player
+# EWM trend slopes
 def compute_ewm_trend_stats_for_player(name, group, col, span):
     group = group.sort_values('game_date')
     values = group[col].shift(1).to_numpy()
     idx = group.index.to_numpy()
     slopes = np.full(len(values), np.nan, dtype=np.float32)
-    
-    # Manually compute exponentially weighted regression
     for i in range(span - 1, len(values)):
         y = values[:i + 1]
         x = np.arange(len(y)).reshape(-1, 1)
@@ -238,85 +288,127 @@ def compute_ewm_trend_stats_for_player(name, group, col, span):
                 pass
     return idx, slopes
 
-for span in [4, 9]:
+for span in [5, 9, 19]:
     for col in targets:
-        groups = gamelogs.groupby('athlete_display_name')
-        results = Parallel(n_jobs=-1, backend='loky', verbose=1)(
-            delayed(compute_ewm_trend_stats_for_player)(name, grp, col, span)
-            for name, grp in groups
+        groups = gamelogs.groupby(['athlete_display_name', 'season'])
+        results = TqdmParallel(n_jobs=-1, total=len(groups))(
+            delayed(compute_ewm_trend_stats_for_player)(name, grp, col, span) for name, grp in groups
         )
         slope_arr = np.full(len(gamelogs), np.nan, dtype=np.float32)
-
         for idxs, slopes in results:
             slope_arr[idxs] = slopes
-
         gamelogs[f'{col}_ewm_trend_slope_{span}'] = slope_arr
 
-gamelogs['points_ewm_std_span9'] = (
-    gamelogs
-    .groupby('athlete_display_name')['points']
-    .transform(lambda x: x.shift(1).ewm(span=9, adjust=False).std())
+# Opponent EWM stats
+opponent_stats = ['points', 'rebounds', 'assists', 'three_point_field_goals_made']
+ewm_spans = [5, 9, 19]
+
+def compute_opponent_ewm_allowed(stat, span):
+    opponent_daily = (
+        gamelogs
+        .groupby(['opponent_team_abbreviation', 'season', 'game_date'])[stat]
+        .sum()
+        .reset_index()
+        .sort_values(['opponent_team_abbreviation', 'season', 'game_date'])
+    )
+    ewm_col = f'opponent_ewm_{stat}_allowed_span{span}'
+    opponent_daily[ewm_col] = (
+        opponent_daily
+        .groupby(['opponent_team_abbreviation', 'season'])[stat]
+        .transform(lambda x: x.shift(1).ewm(span=span, adjust=False).mean())
+    )
+    return opponent_daily[['opponent_team_abbreviation', 'season', 'game_date', ewm_col]]
+
+opponent_ewm_results = TqdmParallel(n_jobs=-1, total=len(opponent_stats)*len(ewm_spans))(
+    delayed(compute_opponent_ewm_allowed)(stat, span)
+    for stat in opponent_stats
+    for span in ewm_spans
 )
 
-# Flag hot games: points >= 1 std dev above EWM mean
-gamelogs['is_hot_game'] = (
-    (gamelogs['points'] >= gamelogs['points_ewm_mean_span9'] + gamelogs['points_ewm_std_span9'])
-    .fillna(False)
-    .astype(int)
-)
+for result in opponent_ewm_results:
+    gamelogs = gamelogs.merge(result, on=['opponent_team_abbreviation', 'season', 'game_date'], how='left')
 
-# Compute consecutive hot streaks
+# Specify Interactions
+for span in [5, 9, 19]:
+    gamelogs[f'interaction_points_ewm_span{span}'] = (
+        gamelogs[f'points_ewm_mean_span{span}'] *
+        gamelogs[f'opponent_ewm_points_allowed_span{span}']
+    )
+    gamelogs[f'interaction_rebounds_ewm_span{span}'] = (
+        gamelogs[f'rebounds_ewm_mean_span{span}'] *
+        gamelogs[f'opponent_ewm_rebounds_allowed_span{span}']
+    )
+    gamelogs[f'interaction_assists_ewm_span{span}'] = (
+        gamelogs[f'assists_ewm_mean_span{span}'] *
+        gamelogs[f'opponent_ewm_assists_allowed_span{span}']
+    )
+    gamelogs[f'interaction_3pm_ewm_span{span}'] = (
+        gamelogs[f'three_point_field_goals_made_ewm_mean_span{span}'] *
+        gamelogs[f'opponent_ewm_three_point_field_goals_made_allowed_span{span}']
+    )
+
+# EWM STD
+gamelogs['points_ewm_std_span9'] = gamelogs.groupby(['athlete_display_name', 'season'])['points'].transform(lambda x: x.shift(1).ewm(span=9, adjust=False).std())
+
+# Hot/cold flags
+gamelogs['is_hot_game'] = ((gamelogs['points'] >= gamelogs['points_ewm_mean_span9'] + gamelogs['points_ewm_std_span9']).fillna(False).astype(int))
+gamelogs['is_cold_game'] = ((gamelogs['points'] < gamelogs['points_ewm_mean_span9'] - gamelogs['points_ewm_std_span9']).fillna(False).astype(int))
+
+# Streaks
 gamelogs['hot_streak'] = (
     gamelogs
-    .sort_values(['athlete_display_name', 'game_date'])
-    .groupby('athlete_display_name')['is_hot_game']
-    .transform(lambda x:
-        x.shift(1)
-         .groupby((x.shift(1) != 1).cumsum())
-         .cumcount()
-    )
+    .sort_values(['athlete_display_name', 'season', 'game_date'])
+    .groupby(['athlete_display_name', 'season'])['is_hot_game']
+    .transform(lambda x: x.shift(1).groupby((x.shift(1) != 1).cumsum()).cumcount())
     .astype(np.int32)
 )
 
-# Flag cold games: points < 1 std dev below EWM mean
-gamelogs['is_cold_game'] = (
-    (gamelogs['points'] < gamelogs['points_ewm_mean_span9'] - gamelogs['points_ewm_std_span9'])
-    .fillna(False)
-    .astype(int)
-)
-
-# Compute consecutive cold streaks
 gamelogs['cold_streak'] = (
     gamelogs
-    .sort_values(['athlete_display_name', 'game_date'])
-    .groupby('athlete_display_name')['is_cold_game']
-    .transform(lambda x:
-        x.shift(1)
-         .groupby((x.shift(1) != 1).cumsum())
-         .cumcount()
-    )
+    .sort_values(['athlete_display_name', 'season', 'game_date'])
+    .groupby(['athlete_display_name', 'season'])['is_cold_game']
+    .transform(lambda x: x.shift(1).groupby((x.shift(1) != 1).cumsum()).cumcount())
     .astype(np.int32)
 )
 
-# Cleanup
-gamelogs = gamelogs.drop(columns=['is_hot_game', 'is_cold_game'], axis=1)
+# Drop temp columns
+gamelogs = gamelogs.drop(columns=[
+    'is_hot_game', 'is_cold_game', 'points_ewm_std_span9'
+], axis=1)
 
-# Filter Post-COVID
+# Opponent stats to compute
+opponent_stats = ['points', 'rebounds', 'assists', 'three_point_field_goals_made']
+ewm_spans = [5, 9, 19]
+
+# Drop Opponent Columns, Leaving Interactions Only
+gamelogs = gamelogs.drop(columns=[col for col in gamelogs.columns if col.startswith("opponent_ewm_")])
+
+# Downcast float64 to float32
+float_cols = gamelogs.select_dtypes(include=['float64']).columns
+gamelogs[float_cols] = gamelogs[float_cols].astype(np.float32)
+
+# Downcast int64 to int32
+int_cols = gamelogs.select_dtypes(include=['int64']).columns
+gamelogs[int_cols] = gamelogs[int_cols].astype(np.int32)
+
+# ---------------------------------------------------
+# Feature Selection
+# ---------------------------------------------------
 gamelogs = gamelogs[gamelogs["season"] >= 2022].copy().reset_index(drop=True)
 
-# Drop Columns
 gamelogs = gamelogs.drop(columns=[
     'plus_minus', 'ejected', 'did_not_play', 'team_winner', 'active',
     'season_type', 'starter'
     ])
 
 lagged_rolling_features = [col for col in gamelogs.columns
-                           if 'trend' in col or 'lag' in col 
-                           or 'momentum' in col or 'streak' in col
-                           or 'span' in col or 'ewm' in col]
+                           if 'rolling' in col or 'trend' in col or 'lag' in col 
+                           or 'expanding' in col or 'momentum' in col or 'streak' in col
+                           or 'span' in col or 'ewm' in col or 'spread' in col]
 
 numeric_features = lagged_rolling_features + ['days_since_last_game']
-categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff", "starter_injured"]
+categorical_features = ["home_away", "athlete_position_abbreviation", "is_playoff",
+                        "starter_injured", "is_back_to_back", "home_favorite"]
 features = numeric_features + categorical_features
 
 # Add missing flag
@@ -324,7 +416,6 @@ def add_generic_missing_flag(X_df, feature_list):
     X_df = X_df.copy()
     X_df['was_missing'] = X_df[feature_list].isna().any(axis=1).astype(int)
     return X_df
-
 gamelogs = add_generic_missing_flag(gamelogs, features)
 
 # Final recomputed feature groups
@@ -335,6 +426,9 @@ features = list(dict.fromkeys(features))
 numeric_features = list(dict.fromkeys(numeric_features))
 categorical_features = list(dict.fromkeys(categorical_features))
 
+# ---------------------------------------------------
+# Build Upcoming Gamelogs w/ Predictions
+# ---------------------------------------------------
 # compute player clusters
 full = gamelogs.groupby('athlete_display_name')[numeric_features].mean().reset_index()
 kmeans_final = joblib.load("nba_player_clustering.joblib")
@@ -371,12 +465,28 @@ sched.columns = [c[:-2] if c.endswith('_x') else c for c in sched]
 sched['game_date'] = pd.to_datetime(sched['game_date'],errors='coerce')
 
 # ---------------- Load Models ----------------
+# Core pipelines and models
 pre = joblib.load("preprocessor_pipeline.joblib")
 meta_model = joblib.load("nba_meta_model.joblib")
 lm_mt = joblib.load("nba_secondary_model.joblib")
 calibrated_estimators = joblib.load("calibrated_logreg_estimators.joblib")
-calibrated_explosive = joblib.load("calibrated_explosive_model.joblib")
-correction_models = joblib.load("bias_correction_models.pkl")  # dict of LinearRegression
+target_names = joblib.load("calibrated_logreg_target_names.joblib")  # Optional if needed
+
+# Explosive stat names (must match training phase)
+explosive_stats = [
+    "points", "rebounds", "assists", "three_point_field_goals_made", "steals", "blocks"
+]
+
+# Load calibrated explosive models and thresholds
+calibrated_explosive_models = {}
+explosive_thresholds = {}
+
+for stat in explosive_stats:
+    model_path = f"explosive_{stat}_calibrated_model.joblib"
+    threshold_path = f"explosive_{stat}_threshold.joblib"
+
+    calibrated_explosive_models[stat] = joblib.load(model_path)
+    explosive_thresholds[stat] = joblib.load(threshold_path)
 
 # ---------------- Process Input ----------------
 ct = pre.named_steps['transform']
@@ -384,38 +494,50 @@ input_cols = list(ct.feature_names_in_)
 Xp = sched[input_cols]
 Xp_proc = pre.transform(Xp)
 
-# ---------------- Stage 1: Predictions ----------------
-# Classification Bins (calibrated class labels)
-c = np.column_stack([est.predict(Xp_proc) for est in calibrated_estimators])
+# ---------------- Stage 1: Base Predictions ----------------
+# Classification Labels (bins)
+c = np.column_stack([
+    est.predict(Xp_proc) for est in calibrated_estimators
+])
 
 # Classification Probabilities
-p = np.column_stack([est.predict_proba(Xp_proc)[:, 1] for est in calibrated_estimators])
+p = np.column_stack([
+    est.predict_proba(Xp_proc)[:, 1] for est in calibrated_estimators
+])
 
-# Explosive classification
-e_pred = calibrated_explosive.predict(Xp_proc).reshape(-1, 1)
-e_proba = calibrated_explosive.predict_proba(Xp_proc)[:, 1].reshape(-1, 1)
+# Explosive Labels & Probabilities (with thresholds applied)
+e_preds = []
+e_probs = []
+
+for stat in explosive_stats:
+    model = calibrated_explosive_models[stat]
+    threshold = explosive_thresholds[stat]
+
+    proba = model.predict_proba(Xp_proc)[:, 1]
+    pred = (proba > threshold).astype(int)
+
+    e_probs.append(proba.reshape(-1, 1))
+    e_preds.append(pred.reshape(-1, 1))
+
+# Stack explosive outputs
+e_pred_stack = np.hstack(e_preds)
+e_proba_stack = np.hstack(e_probs)
 
 # Regression outputs (secondary model)
 s = lm_mt.predict(Xp_proc)
 
 # ---------------- Stage 2: Meta Prediction ----------------
-# Align stacking
-Xp_meta = np.hstack([Xp_proc, c, p, e_pred, e_proba, s])
+Xp_meta = np.hstack([
+    Xp_proc,        # Preprocessed inputs
+    c,              # Classification labels
+    p,              # Classification probs
+    e_pred_stack,   # Explosive binary predictions (thresholded)
+    e_proba_stack,  # Explosive probabilities
+    s               # Secondary regression output
+])
 
 # Predict with meta-model
 raw_preds = meta_model.predict(Xp_meta)
-
-# ---------------- Stage 3: Apply Bias Correction ----------------
-# Correct each target using stored linear post-hoc correction
-columns = list(correction_models.keys())
-corrected_preds = pd.DataFrame(index=sched.index, columns=columns)
-
-# Apply bias correction
-corrected_preds = pd.DataFrame(index=sched.index, columns=columns)
-
-for i, col in enumerate(columns):
-    model = correction_models[col]
-    corrected_preds[col] = model.predict(raw_preds[:, i].reshape(-1, 1))
 
 # Rename to match expected output column names
 pred_cols = [
@@ -426,10 +548,11 @@ pred_cols = [
     'predicted_blocks',
     'predicted_points'
 ]
-corrected_preds.columns = pred_cols
+# Convert to DataFrame and assign column names
+raw_preds = pd.DataFrame(raw_preds, columns=pred_cols)
 
 # Add predictions to sched
-sched[pred_cols] = corrected_preds
+sched[pred_cols] = raw_preds
 
 # Construct final output DataFrame
 df = sched[[
@@ -438,7 +561,7 @@ df = sched[[
     'game_date','home_away'
 ]].reset_index(drop=True)
 
-df = pd.concat([df, corrected_preds.reset_index(drop=True)], axis=1)
+df = pd.concat([df, raw_preds.reset_index(drop=True)], axis=1)
 today = date.today()
 start = pd.to_datetime(today - timedelta(days=today.weekday()))
 end   = start + timedelta(days=6)
@@ -460,22 +583,94 @@ try:
 except Exception as e:
     print("Warning fetching headshots:",e)
 
-# process betting odds
+# ---------------------------------------------------
+# Scraping Odds
+# ---------------------------------------------------
+API_KEY = '4d687f31fa6a19e0c3609594ee620698'
+SPORT = 'basketball_nba'
+REGION = 'us'
+BOOKMAKER = 'draftkings'
+MARKETS = [
+    'player_points', 'player_assists', 'player_rebounds',
+    'player_steals', 'player_blocks', 'player_threes'
+]
+
+# Step 1: Get upcoming NBA events
+events_url = f'https://api.the-odds-api.com/v4/sports/{SPORT}/odds'
+params = {
+    'apiKey': API_KEY,
+    'regions': REGION,
+    'markets': 'h2h',
+    'oddsFormat': 'decimal'
+}
+response = requests.get(events_url, params=params)
+response.raise_for_status()
+events = response.json()
+
+# Step 2: Fetch player props with player names and odds
+all_props = []
+
+for event in events:
+    event_id = event['id']
+    event_url = f'https://api.the-odds-api.com/v4/sports/{SPORT}/events/{event_id}/odds'
+    params = {
+        'apiKey': API_KEY,
+        'regions': REGION,
+        'markets': ','.join(MARKETS),
+        'oddsFormat': 'decimal',
+        'bookmakers': BOOKMAKER
+    }
+    event_response = requests.get(event_url, params=params)
+    if event_response.status_code != 200:
+        print(f"Failed to fetch props for event {event_id}: {event_response.status_code}, {event_response.text}")
+        continue
+    event_data = event_response.json()
+
+    for bookmaker in event_data.get('bookmakers', []):
+        for market in bookmaker.get('markets', []):
+            for outcome in market.get('outcomes', []):
+                all_props.append({
+                    'event': f"{event_data['home_team']} vs {event_data['away_team']}",
+                    'market': market['key'],                  # e.g., player_points
+                    'label': outcome['name'],                # Over / Under
+                    'description': outcome.get('description'),  # Player name
+                    'point': outcome.get('point'),
+                    'price': outcome['price']
+                })
+
+# Step 3: Convert to DataFrame
+betting_odds_df = pd.DataFrame(all_props)
+
+# Step 4: Pivot and clean
 od = betting_odds_df.copy()
-od['market_label'] = od['label'] + " " + od['market'].str.replace('player_','',regex=False).str.title()
-pp = od.pivot_table(index='description',columns='market_label',values='price',aggfunc='first')
-pt = od.pivot_table(index='description',columns='market_label',values='point',aggfunc='first')
-pp.columns=[f"{c} - Price" for c in pp.columns]
-pt.columns=[f"{c} - Point" for c in pt.columns]
-pivot = pd.concat([pp,pt],axis=1).reset_index().rename(columns={'description':'player_name'})
-stats = {c.split(" - ")[0].split(" ",1)[1] for c in pivot if " - " in c}
-cols=['player_name']
+od['market_label'] = od['label'] + " " + od['market'].str.replace('player_', '', regex=False).str.title()
+
+pp = od.pivot_table(index='description', columns='market_label', values='price', aggfunc='first')
+pt = od.pivot_table(index='description', columns='market_label', values='point', aggfunc='first')
+
+pp.columns = [f"{c} - Price" for c in pp.columns]
+pt.columns = [f"{c} - Point" for c in pt.columns]
+
+pivot = pd.concat([pp, pt], axis=1).reset_index().rename(columns={'description': 'player_name'})
+
+# Step 5: Select relevant columns only
+stats = {c.split(" - ")[0].split(" ", 1)[1] for c in pivot.columns if " - " in c}
+cols = ['player_name']
 for stat in sorted(stats):
-    for lbl in ['Over','Under']:
-        for m in ['Price','Point']:
-            cn=f"{lbl} {stat} - {m}"
-            if cn in pivot: cols.append(cn)
+    for lbl in ['Over', 'Under']:
+        for m in ['Price', 'Point']:
+            cn = f"{lbl} {stat} - {m}"
+            if cn in pivot.columns:
+                cols.append(cn)
 pivot = pivot[cols]
+
+# Step 6: Normalize player names
+pivot['player_name'] = (
+    pivot['player_name']
+         .str.replace(r'[^\w\s]', '', regex=True)
+         .str.replace(r'\b(?:[IVX]+)$', '', regex=True)
+         .str.strip()
+)
 
 # create normalized join‐key for df
 df['norm'] = (
@@ -485,14 +680,9 @@ df['norm'] = (
       .str.strip()
 )
 
-# normalize player_name in pivot
-pivot['player_name'] = (
-    pivot['player_name']
-         .str.replace(r'[^\w\s]', '', regex=True)
-         .str.replace(r'\b(?:[IVX]+)$', '', regex=True)
-         .str.strip()
-)
-
+# ---------------------------------------------------
+# Final Output
+# ---------------------------------------------------
 # merge df with pivot
 out = df.merge(
     pivot,

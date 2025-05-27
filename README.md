@@ -51,7 +51,6 @@ This project integrates advanced machine learning, temporal validation, player c
 2. **Classification Layer:** Predict binned outcomes, then calibrate and add predicted bins and probabilities
 3. **Explosive Game Classification Layer:** Predict whether a player will score more than 30 points or not, then calibrate and add predicted label and probabilities
 4. **Meta Model:** Final prediction via stacked features
-5. **Post Hoc Bias Correction:** Final predictions are passed through a set of bias-correction models to reduce systematic over/underestimation in key stats
 
 ### 🧪 Evaluation
 - Final Metrics: RMSE, MAE, R², Pinball Loss (α=0.1 and α=0.9)

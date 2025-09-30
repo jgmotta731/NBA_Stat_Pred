@@ -1,0 +1,78 @@
+#!/usr/bin/env Rscript
+# Runs update_nba_data.R only during the NBA season.
+# Includes a simple month/day guard, a lock file to avoid overlapping runs, and timestamped logs with clear exit codes for Task Scheduler.
+
+# Paths and files
+proj     <- "C:/Users/jgmot/NBA_Prediction_Tool"
+rscript  <- "C:/Program Files/R/R-4.4.1/bin/Rscript.exe"
+main_r   <- file.path(proj, "R_Scripts", "update_nba_data.R")
+log_dir  <- file.path(proj, "logs")
+lockfile <- file.path(log_dir, "data_refresh.lock")
+
+# Season window (month/day only)
+in_season <- function(today = Sys.Date()){
+  m <- as.integer(format(today, "%m")); d <- as.integer(format(today, "%d"))
+  ((m == 10 && d >= 21) || m %in% c(11,12)) || (m %in% c(1,2,3,4,5) || (m == 6 && d <= 22))
+}
+
+# Skip if out of season
+if (!in_season()) {
+  message("Out of NBA season — skipping data refresh.")
+  quit(status = 0)
+}
+
+# Ensure logs directory exists
+if (!dir.exists(log_dir)) dir.create(log_dir, recursive = TRUE)
+
+# Lock file to avoid overlapping runs (treat <8h as active)
+if (file.exists(lockfile)) {
+  age_hours <- as.numeric(difftime(Sys.time(), file.info(lockfile)$mtime, units = "hours"))
+  if (!is.na(age_hours) && age_hours < 8) {
+    message("Lock present — exiting.")
+    quit(status = 0)
+  } else {
+    message("Stale lock — continuing.")
+  }
+}
+file.create(lockfile)
+on.exit({ if (file.exists(lockfile)) file.remove(lockfile) }, add = TRUE)
+
+# Set working directory
+setwd(proj)
+
+# Log files (timestamped and latest)
+ts <- format(Sys.time(), "%Y-%m-%d_%H-%M-%S")
+logfile <- file.path(log_dir, paste0("data_refresh_", ts, ".log"))
+latest  <- file.path(log_dir, "data_refresh_latest.log")
+if (file.exists(latest)) file.remove(latest)
+
+# Run the data script in a separate R process; capture stdout+stderr in the log
+res <- tryCatch(
+  {
+    system2(
+      command = rscript,
+      args    = c(shQuote(main_r)),
+      stdout  = logfile,
+      stderr  = logfile,
+      wait    = TRUE
+    )
+  },
+  error = function(e) {
+    writeLines(paste("Launcher error:", conditionMessage(e)), con = logfile)
+    1L
+  }
+)
+
+# Normalize NULL return (treat as success)
+if (is.null(res)) res <- 0L
+
+# Keep a copy of the latest log
+file.copy(logfile, latest, overwrite = TRUE)
+
+# Exit with status for Task Scheduler (0 = success)
+if (res != 0L) {
+  message("update_nba_data.R failed (code ", res, ").")
+  quit(status = res)
+}
+message("update_nba_data.R completed OK.")
+quit(status = 0)

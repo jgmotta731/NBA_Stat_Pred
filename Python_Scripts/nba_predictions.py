@@ -1,0 +1,373 @@
+# ---------------------------------------------------
+# NBA Predictions Pipeline for New Data
+# Created on Apr 29, 2025
+# Author: Jack Motta
+# ---------------------------------------------------
+import os
+import warnings
+import joblib
+import requests
+import numpy as np
+import pandas as pd
+from datetime import date, timedelta
+from unidecode import unidecode
+from nba_api.stats.static import players
+import torch
+from Python_Scripts.scraping_loading import run_scrape_and_load
+from Python_Scripts.feature_engineering import run_feature_engineering
+from Python_Scripts.bnn import QuantileBNN, predict_mc
+
+# ---------------------------------------------------
+# Config
+# ---------------------------------------------------
+warnings.filterwarnings("ignore")
+
+DATASETS_DIR = "datasets"
+PREDICTIONS_DIR = "predictions"
+os.makedirs(DATASETS_DIR, exist_ok=True)
+os.makedirs(PREDICTIONS_DIR, exist_ok=True)
+
+def current_season_bounds(today=None):
+    """
+    Returns (start_year, end_year) for the current NBA season.
+    Oct–Dec → season N–(N+1); Jan–Sep → (N-1)–N.
+    """
+    today = today or date.today()
+    if today.month >= 10:   # Oct–Dec
+        return today.year, today.year + 1
+    else:                   # Jan–Sep
+        return today.year - 1, today.year
+
+def season_label(start_year, end_year):
+    return f"{start_year}-{str(end_year)[-2:]}"
+
+def build_seasons(first_start_year=2021):
+    """
+    Builds season labels from first_start_year up through the *current* season.
+    When October arrives, it will automatically include the new season (e.g., 2025-26).
+    """
+    cur_start, cur_end = current_season_bounds()
+    labels = []
+    for y in range(first_start_year, cur_start + 1):
+        labels.append(season_label(y, y + 1))
+    return labels
+
+SEASONS = build_seasons(first_start_year=2021)
+SEASONS = ["2021-22", "2022-23", "2023-24", "2024-25", "2025-2026"]
+PREPROCESSED_PATH = "datasets/gamelogs_ready_for_fe.parquet"
+FEATURED_PATH     = "datasets/gamelogs_features.parquet"
+SCHEDULE_PATH = f"{DATASETS_DIR}/nba_schedule.parquet"
+GAMELOGS_PATH = f"{DATASETS_DIR}/nba_gamelogs.parquet"
+
+def main():
+    # ---------------------------------------------------
+    # Step 1: Scrape + load + preprocess (caches to PREPROCESSED_PATH)
+    # ---------------------------------------------------
+    gamelogs = run_scrape_and_load(
+        seasons=SEASONS,
+        preprocessed_path=PREPROCESSED_PATH
+    )
+
+    # ---------------------------------------------------
+    # Step 2: Feature engineering (caches to FEATURED_PATH)
+    # ---------------------------------------------------
+    gamelogs, feature_groups = run_feature_engineering(
+        gamelogs,
+        save_path=FEATURED_PATH,
+        cache_read=True,
+        cache_write=True,
+        id_col="GAME_ID"
+    )
+
+    # feature groups from training
+    features             = feature_groups["features"]
+    numeric_features     = feature_groups["numeric_features"]
+    categorical_features = feature_groups["categorical_features"]
+    embedding_features   = feature_groups["embedding_features"]
+    prior_features       = feature_groups["prior_features"]
+    targets              = feature_groups["targets"]  # ['three_point_field_goals_made', ..., 'points']
+
+    # ---------------------------------------------------
+    # Step 3: player clustering (same preprocessing as training)
+    # ---------------------------------------------------
+    kmeans_final = joblib.load("models/clustering/nba_player_clustering.joblib")
+    pca_pipeline = joblib.load("pipelines/pca_pipeline.joblib")
+
+    # stat columns the PCA expects (robust to missing columns)
+    stat_cols = []
+    targets_with_both = ["field_goals_made"]
+    targets_mean_only = ["field_goals_attempted", "reb_pct", "ast_pct", "usg_pct", "poss", "three_point_field_goals_attempted"]
+    targets_std_only  = ["points", "assists", "rebounds", "steals", "blocks", "three_point_field_goals_made"]
+    for t in targets_with_both + targets_mean_only:
+        cm = f"{t}_expanding_mean"
+        if cm in gamelogs.columns:
+            stat_cols.append(cm)
+    for t in targets_with_both + targets_std_only:
+        cs = f"{t}_expanding_std"
+        if cs in gamelogs.columns:
+            stat_cols.append(cs)
+
+    full_player_summary = (
+        gamelogs.sort_values(["athlete_display_name", "game_date"])
+                .groupby("athlete_display_name")
+                .tail(1)
+                .reset_index(drop=True)
+    )
+    if stat_cols:
+        X_full_cluster = pca_pipeline.transform(full_player_summary[stat_cols])
+        full_player_summary["cluster_label"] = kmeans_final.predict(X_full_cluster) + 1
+        player_clusters = full_player_summary[["athlete_display_name", "cluster_label"]].copy()
+        player_clusters["cluster_label"] = player_clusters["cluster_label"].astype("float32")
+        gamelogs = (
+            gamelogs.drop(columns=["cluster_label"], errors="ignore")
+                    .merge(player_clusters, on="athlete_display_name", how="left")
+        )
+        if "cluster_label" not in categorical_features:
+            categorical_features += ["cluster_label"]
+        if "cluster_label" not in features:
+            features += ["cluster_label"]
+
+    # ---------------------------------------------------
+    # Step 4: upcoming schedule → build prediction rows
+    # ---------------------------------------------------
+    schedule = pd.read_parquet(SCHEDULE_PATH)
+
+    latest = (
+        gamelogs
+        .sort_values("game_date")
+        .groupby("athlete_display_name", as_index=False)
+        .tail(1)
+    )
+        
+    sched = schedule.loc[
+        (schedule.home_abbreviation != "TBD") &
+        (schedule.away_abbreviation != "TBD")
+    ].copy()
+
+    sched["home_away"] = "home"
+    away = sched.copy()
+    away["home_away"] = "away"
+    away[["home_abbreviation", "away_abbreviation"]] = away[["away_abbreviation", "home_abbreviation"]]
+
+    sched = (
+        pd.concat([sched, away], ignore_index=True)
+          .rename(columns={"home_abbreviation": "team_abbreviation",
+                           "away_abbreviation": "opponent_team_abbreviation"})
+          .merge(latest, on="team_abbreviation", how="left")
+          .dropna(subset=["athlete_display_name"])
+    )
+
+    # tidy duped suffixes
+    sched = sched.drop(columns=[c for c in sched.columns if c.endswith("_y")])
+    sched.columns = [c[:-2] if c.endswith("_x") else c for c in sched.columns]
+    sched["game_date"] = pd.to_datetime(sched["game_date"], errors="coerce")
+
+    # ---------------------------------------------------
+    # Step 5: load preprocessing artifacts & build tensors
+    # ---------------------------------------------------
+    preprocessor    = joblib.load("pipelines/preprocessor_pipeline.joblib")
+    prior_pipeline  = joblib.load("pipelines/prior_pipeline.joblib")
+    embed_encoder   = joblib.load("pipelines/embed_encoder.joblib")
+    embedding_sizes = joblib.load("pipelines/embedding_sizes.joblib")
+
+    # embeddings (IDs were +1/clamped in training)
+    for col in embedding_features:
+        sched[col] = sched[col].astype(str)
+    Xp_embed = embed_encoder.transform(sched[embedding_features]).astype(np.int64) + 1
+    for j, (num_embeddings, _) in enumerate(embedding_sizes):
+        Xp_embed[:, j] = np.clip(Xp_embed[:, j], 0, num_embeddings - 1)
+    Xp_embed_tensor = torch.tensor(Xp_embed, dtype=torch.long)
+
+    # numeric block via training preprocessor
+    Xp = sched[preprocessor.named_steps["transform"].feature_names_in_]
+    Xp_proc_base = preprocessor.transform(Xp)
+    Xp_proc = pd.DataFrame(Xp_proc_base, columns=preprocessor.get_feature_names_out())
+
+    # priors (expanding_mean/std for the 6 targets, already in prior_features order)
+    Xp_prior = prior_pipeline.transform(sched[prior_features]).astype(np.float32)
+    Xp_prior_tensor = torch.tensor(Xp_prior, dtype=torch.float32)
+
+    # final numeric tensor (drop embed cols; there is no 'target' column at inference)
+    Xp_num_tensor = torch.tensor(
+        Xp_proc.drop(columns=[c for c in embedding_features if c in Xp_proc.columns], errors="ignore").values,
+        dtype=torch.float32
+    )
+
+    # ---------------------------------------------------
+    # Step 6: BNN model (same architecture as training) + weights
+    #         Aux heads exist in the architecture but are not needed for inference.
+    # ---------------------------------------------------
+    model = QuantileBNN(
+        input_dim=Xp_num_tensor.shape[1],
+        embedding_sizes=embedding_sizes,
+        prior_dim=Xp_prior_tensor.shape[1],
+        output_dim=len(targets),
+        aux_dim=len(targets),   # matches training signature; unused during predict_mc
+    )
+    state_path = "models/bnn/nba_bnn_weights_only.pt"
+    model.load_state_dict(torch.load(state_path, map_location="cpu"))
+    model.train()   # keep dropout on for MC sampling
+    model.to("cpu")
+
+    # ---------------------------------------------------
+    # Step 7: MC-dropout predictions, then invert scaling
+    # ---------------------------------------------------
+    mean_pred, std_pred, lower_pred, upper_pred, median_pred = predict_mc(
+        model=model,
+        X_num=Xp_num_tensor,
+        X_embed=Xp_embed_tensor,
+        prior_tensor=Xp_prior_tensor,
+        T=50
+    )
+
+    y_scaler        = joblib.load("pipelines/y_scaler.joblib")
+    y_val_mean_unscaled   = y_scaler.inverse_transform(mean_pred)
+    y_val_median_unscaled = y_scaler.inverse_transform(median_pred)
+    y_val_lower_unscaled  = y_scaler.inverse_transform(lower_pred)
+    y_val_upper_unscaled  = y_scaler.inverse_transform(upper_pred)
+
+    pred_df = pd.DataFrame(y_val_mean_unscaled, columns=[f"{t}_mean" for t in targets])
+    pred_df[[f"{t}_lower"  for t in targets]] = y_val_lower_unscaled
+    pred_df[[f"{t}_upper"  for t in targets]] = y_val_upper_unscaled
+    pred_df[[f"{t}_median" for t in targets]] = y_val_median_unscaled
+    pred_df["athlete_display_name"] = sched["athlete_display_name"].values
+    pred_df["game_id"] = sched.get("game_id", pd.Series(index=sched.index, dtype="object"))
+
+    # ---------------------------------------------------
+    # Step 8: assemble output rows
+    # ---------------------------------------------------
+    sched = sched.reset_index(drop=True)
+    sched = pd.concat([sched, pred_df], axis=1)
+
+    df = sched[[
+        "athlete_display_name", "athlete_position_abbreviation",
+        "team_abbreviation", "opponent_team_abbreviation",
+        "game_date", "home_away"
+    ]].reset_index(drop=True)
+
+    df = pd.concat(
+        [df, pred_df.drop(columns=["athlete_display_name", "game_id"]).reset_index(drop=True)],
+        axis=1
+    )
+
+    today = date.today()
+    start = pd.to_datetime(today - timedelta(days=today.weekday()))
+    end   = start + timedelta(days=6)
+    df = df[(df.game_date >= start) & (df.game_date <= end)]
+    df = df.sort_values("game_date").drop_duplicates("athlete_display_name", keep="first")
+    df["game_date"] = df["game_date"].dt.strftime("%Y-%m-%d")
+
+    # headshots
+    try:
+        pdp = pd.DataFrame(players.get_active_players())
+        pdp["headshot_url"] = pdp["id"].apply(lambda i: f"https://cdn.nba.com/headshots/nba/latest/1040x760/{i}.png")
+        pdp["norm"] = pdp["full_name"].apply(lambda s: unidecode(s).title())
+        df["norm"] = df["athlete_display_name"].apply(lambda s: unidecode(s).title())
+        df = df.merge(pdp, on="norm", how="left").drop(columns=["id","full_name","first_name","last_name","is_active","norm"])
+    except Exception as e:
+        print("Warning fetching headshots:", e)
+
+    # ---------------------------------------------------
+    # Step 9: odds scrape for filtering
+    # ---------------------------------------------------
+    try:
+        API_KEY   = "[redacted]"
+        SPORT     = "basketball_nba"
+        REGION    = "us"
+        BOOKMAKER = "draftkings"
+        MARKETS   = ["player_points","player_assists","player_rebounds","player_steals","player_blocks","player_threes"]
+
+        events_url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
+        params = {"apiKey": API_KEY, "regions": REGION, "markets": "h2h", "oddsFormat": "decimal"}
+        response = requests.get(events_url, params=params, timeout=20)
+        response.raise_for_status()
+        events = response.json()
+
+        all_props = []
+        for event in events:
+            event_id = event["id"]
+            event_url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/events/{event_id}/odds"
+            params = {"apiKey": API_KEY, "regions": REGION, "markets": ",".join(MARKETS),
+                      "oddsFormat": "decimal", "bookmakers": BOOKMAKER}
+            event_response = requests.get(event_url, params=params, timeout=20)
+            if event_response.status_code != 200:
+                print(f"Failed to fetch props for event {event_id}: {event_response.status_code}, {event_response.text}")
+                continue
+            event_data = event_response.json()
+            for bookmaker in event_data.get("bookmakers", []):
+                for market in bookmaker.get("markets", []):
+                    for outcome in market.get("outcomes", []):
+                        all_props.append({
+                            "event": f"{event_data.get('home_team')} vs {event_data.get('away_team')}",
+                            "market": market.get("key"),
+                            "label": outcome.get("name"),
+                            "description": outcome.get("description"),
+                            "point": outcome.get("point"),
+                            "price": outcome.get("price"),
+                        })
+
+        if all_props:
+            betting_odds_df = pd.DataFrame(all_props)
+            od = betting_odds_df.copy()
+            od["market_label"] = od["label"] + " " + od["market"].str.replace("player_", "", regex=False).str.title()
+
+            pp = od.pivot_table(index="description", columns="market_label", values="price", aggfunc="first")
+            pt = od.pivot_table(index="description", columns="market_label", values="point", aggfunc="first")
+            pp.columns = [f"{c} - Price" for c in pp.columns]
+            pt.columns = [f"{c} - Point" for c in pt.columns]
+            pivot = pd.concat([pp, pt], axis=1).reset_index().rename(columns={"description": "player_name"})
+
+            stats = {c.split(" - ")[0].split(" ", 1)[1] for c in pivot.columns if " - " in c}
+            cols = ["player_name"]
+            for stat in sorted(stats):
+                for lbl in ["Over", "Under"]:
+                    for m in ["Price", "Point"]:
+                        cn = f"{lbl} {stat} - {m}"
+                        if cn in pivot.columns:
+                            cols.append(cn)
+            pivot = pivot[cols]
+
+            # normalize names for join
+            pivot["player_name"] = (
+                pivot["player_name"]
+                     .str.replace(r"[^\w\s]", "", regex=True)
+                     .str.replace(r"\b(?:[IVX]+)$", "", regex=True)
+                     .str.strip()
+            )
+            df["norm"] = (
+                df["athlete_display_name"]
+                    .str.replace(r"[^\w\s]", "", regex=True)
+                    .str.replace(r"\b(?:[IVX]+)$", "", regex=True)
+                    .str.strip()
+            )
+
+            out = df.merge(pivot, left_on="norm", right_on="player_name", how="inner").drop(columns=["player_name","norm"])
+        else:
+            out = df.copy()
+    except Exception as e:
+        print("Warning fetching odds:", e)
+        out = df.copy()
+
+    # ---------------------------------------------------
+    # Step 10: save parquet
+    # ---------------------------------------------------
+    cols_to_keep = [
+        "athlete_display_name", "athlete_position_abbreviation",
+        "team_abbreviation", "opponent_team_abbreviation",
+        "game_date", "home_away", "headshot_url",
+        "three_point_field_goals_made_mean", "three_point_field_goals_made_lower",
+        "three_point_field_goals_made_upper", "three_point_field_goals_made_median",
+        "rebounds_mean", "rebounds_lower", "rebounds_upper", "rebounds_median",
+        "assists_mean", "assists_lower", "assists_upper", "assists_median",
+        "steals_mean", "steals_lower", "steals_upper", "steals_median",
+        "blocks_mean", "blocks_lower", "blocks_upper", "blocks_median",
+        "points_mean", "points_lower", "points_upper", "points_median",
+    ]
+    out = out[cols_to_keep].copy()
+    today_str = date.today().strftime("%Y-%m-%d")
+    output_path = f"{PREDICTIONS_DIR}/nba_predictions_{today_str}.parquet"
+    out.to_parquet(output_path, index=False)
+    print(f"Saved {output_path}")
+
+if __name__ == "__main__":
+    main()

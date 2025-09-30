@@ -23,7 +23,9 @@ Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custo
 .
 ├─ R_Scripts/
 │  ├─ update_nba_data.R              # Pulls hoopR data; builds lineup/on-off; writes parquet datasets/
-│  └─ launch_update_nba_data.R       # Season guard + logs + lock; calls update_nba_data.R (Task Scheduler)
+│  ├─ launch_update_nba_data.R       # Season guard + logs + lock; calls update_nba_data.R (Task Scheduler)
+|  ├─ www                            # DALL-E generated images for the Shiny App
+│  └─ app.R                          # Shiny app; reactive polling for predictions + metrics (parquet)
 │
 ├─ Python_Scripts/                   # (or project root, depending on your layout)
 │  ├─ scraping_loading.py            # Scrapes advanced data, merges with hoopR gamelogs + injuries, light FE
@@ -35,10 +37,7 @@ Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custo
 │  ├─ nba_predictions.py             # Loads artifacts; produces daily predictions parquet (with Odds filter)
 │  └─ launch_nba_predictions.py      # Season guard + logs + lock; calls nba_predictions.py (Task Scheduler)
 │
-├─ app.R                             # Shiny app; reactive polling for predictions + metrics (parquet)
-├─ datasets/                         # Outputs from data refresh (e.g., gamelogs, schedule, on/off)
 ├─ predictions/                      # Daily predictions parquet (nba_predictions_YYYY-MM-DD.parquet)
-├─ logs/                             # Timestamped logs + latest copy from launchers
 └─ README.md
 ```
 

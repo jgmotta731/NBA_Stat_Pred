@@ -69,6 +69,32 @@ def coverage_penalty(lower, upper, y_true, target=0.8, scale=1.0):
     covered = ((y_true >= lower) & (y_true <= upper)).float().mean()
     return scale * F.relu(target - covered)
 
+def width_penalty(lower, upper, scale=None):
+    """
+    Penalize interval width. Supports per-target scaling.
+    lower/upper: [batch, T]
+    scale: None or tensor[T] of weights per target
+    """
+    w = (upper - lower).clamp(min=0.0)             # [batch, T]
+    if scale is None:
+        return w.mean()
+    scale_t = torch.as_tensor(scale, device=lower.device, dtype=lower.dtype)  # [T]
+    return (w.mean(dim=0) * scale_t).mean()
+
+def over_coverage_penalty(lower, upper, y_true, target=0.8, scale=None):
+    """
+    Penalize only when coverage > target. Supports per-target scaling.
+    Shapes: lower/upper/y_true: [batch, T]
+    target: float
+    scale: None or tensor[T] of weights per target
+    """
+    covered_t = ((y_true >= lower) & (y_true <= upper)).float().mean(dim=0)  # [T]
+    dev = F.relu(covered_t - target)  # over-coverage only
+    if scale is None:
+        return dev.mean()
+    scale_t = torch.as_tensor(scale, device=lower.device, dtype=lower.dtype)  # [T]
+    return (dev * scale_t).mean()
+
 def aux_breakout_bce(aux_probs: torch.Tensor, y_raw: torch.Tensor, tau: torch.Tensor) -> torch.Tensor:
     valid = torch.isfinite(y_raw) & torch.isfinite(tau)
     labels = (y_raw > tau).float()
@@ -84,7 +110,8 @@ def aux_breakout_bce(aux_probs: torch.Tensor, y_raw: torch.Tensor, tau: torch.Te
     return (loss / denom).mean()
 
 def total_loss(mean, lower, upper, median, logvar, y_true, model, weights,
-               kl_scale=1e-4, sharp_scale=1e-3, coverage_scale=1.0):
+               kl_scale=1e-4, sharp_scale=1e-3, coverage_scale=1.0,
+               over_cov_scale=None, width_scales=None):
     logvar = torch.clamp(logvar, min=-5.0, max=5.0)
     var = torch.exp(logvar) + 1e-6
     hetero_loss = ((mean - y_true) ** 2 / var).mean() + var.mean()
@@ -97,7 +124,11 @@ def total_loss(mean, lower, upper, median, logvar, y_true, model, weights,
     sharp = sharpness_penalty(lower, upper, scale=sharp_scale)
     cov   = coverage_penalty(lower, upper, y_true, scale=coverage_scale)
 
-    return (weights * hetero_loss).mean() + pinball_lower + pinball_upper + pinball_median + kl + sharp + cov
+    # Optional terms (can be None)
+    over  = 0.0 if over_cov_scale is None else over_coverage_penalty(lower, upper, y_true, scale=over_cov_scale)
+    wpen  = 0.0 if width_scales   is None else width_penalty(lower, upper, scale=width_scales)
+
+    return (weights * hetero_loss).mean() + pinball_lower + pinball_upper + pinball_median + kl + sharp + cov + over + wpen
 
 # ----------------------------- Model -----------------------------
 class QuantileBNN(nn.Module):
@@ -125,14 +156,17 @@ class QuantileBNN(nn.Module):
         self.heads_upper  = nn.ModuleList([nn.Linear(64, 1) for _ in range(output_dim)])
         self.heads_median = nn.ModuleList([nn.Linear(64, 1) for _ in range(output_dim)])
         self.heads_logvar = nn.ModuleList([nn.Linear(64, 1) for _ in range(output_dim)])
-
+        
         self.alpha = nn.ParameterList([nn.Parameter(torch.tensor(0.5)) for _ in range(output_dim)])
-
+        
+        self.register_buffer("offset_scale", torch.ones(self.output_dim))
+        
         if self.aux_dim > 0:
             self.aux_logits = nn.ModuleList([nn.Linear(64, 1) for _ in range(self.aux_dim)])
-
+        
         # not used directly in loss; kept for parity with earlier versions
         self.register_buffer("temp_vector", torch.tensor([5.0, 5.5, 5.1, 9.1, 6.9, 4.5], dtype=torch.float32))
+        
 
     def _encode(self, x_num, x_embed):
         emb = [self.embedding_dropout(e(x_embed[:, i])) for i, e in enumerate(self.embeddings)]
@@ -142,9 +176,10 @@ class QuantileBNN(nn.Module):
 
     def forward(self, x_num, x_embed, prior, use_prior=True):
         h = self._encode(x_num, x_embed)
-
+    
         means, lowers, uppers, medians, logvars = [], [], [], [], []
         for i in range(self.output_dim):
+            # mean with optional prior blend
             if use_prior and prior is not None and prior.shape[1] >= (i * 2 + 1):
                 prior_mean = prior[:, i * 2 + 0].unsqueeze(1)
                 a = torch.sigmoid(self.alpha[i])
@@ -152,13 +187,22 @@ class QuantileBNN(nn.Module):
                 mean = a * pred_mean + (1 - a) * prior_mean
             else:
                 mean = self.heads_mean[i](h)
-
             means.append(mean)
-            lowers.append(self.heads_lower[i](h))
-            uppers.append(self.heads_upper[i](h))
-            medians.append(self.heads_median[i](h))
-            logvars.append(self.heads_logvar[i](h))
+    
+            # non-crossing: median ± softplus offsets
+            med_raw   = self.heads_median[i](h)
+            delta_low = F.softplus(self.heads_lower[i](h)) * self.offset_scale[i]
+            delta_up  = F.softplus(self.heads_upper[i](h)) * self.offset_scale[i]
+            lower  = med_raw - delta_low
+            upper  = med_raw + delta_up
+            median = med_raw
 
+            lowers.append(lower)
+            uppers.append(upper)
+            medians.append(median)
+    
+            logvars.append(self.heads_logvar[i](h))
+    
         return (
             torch.cat(means, 1),
             torch.cat(lowers, 1),
@@ -235,7 +279,7 @@ def load_bnn_for_inference(
     if isinstance(state, dict) and all(k.startswith(("shared_base", "heads_", "embeddings", "alpha", "norm_input")) for k in state.keys()):
         model.load_state_dict(state)
     else:
-        # fallback if someone saved the entire model; extract state_dict if possible
+        # fallback if saved the entire model; extract state_dict if possible
         try:
             model.load_state_dict(state.state_dict())  # type: ignore[attr-defined]
         except Exception as e:
@@ -334,8 +378,26 @@ def run_bnn(
         output_dim=y_train_tensor.shape[1],
         aux_dim=len(break_targets),
     ).to(device)
-
+    
+    i_steals = targets.index("steals")
+    i_blocks = targets.index("blocks")
+    i_3pm = targets.index("three_point_field_goals_made")
+    i_assists = targets.index("assists")
+    
+    with torch.no_grad():
+        model.offset_scale[i_steals] = torch.tensor(0.85, device=device)
+        model.offset_scale[i_blocks] = torch.tensor(0.85, device=device)
+        model.offset_scale[i_3pm] = torch.tensor(1.00, device=device)
+        model.offset_scale[i_assists] = torch.tensor(1.00, device=device)
+    
+    width_scales = torch.zeros(len(targets), device=device)
+    width_scales[i_steals] = 0.05
+    width_scales[i_blocks] = 0.0425
+    width_scales[i_3pm] = 0.02
+    width_scales[i_assists] = 0.02
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
 
     target_weights = torch.tensor(
         [1.5 if t in ["points", "rebounds", "assists"] else 1.0 for t in targets],
@@ -363,7 +425,13 @@ def run_bnn(
             use_prior = epoch >= aux_warmup
 
             mean, lower, upper, median, logvar = model(xb_num, xb_emb, priorb, use_prior=use_prior)
-            loss_primary = total_loss(mean, lower, upper, median, logvar, yb, model, target_weights)
+            loss_primary = total_loss(
+                mean, lower, upper, median, logvar, yb, model, target_weights,
+                sharp_scale=0.0,
+                coverage_scale=0.0,
+                over_cov_scale=None,
+                width_scales=width_scales
+            )
 
             if epoch >= aux_warmup:
                 aux_probs = model.forward_aux(xb_num, xb_emb)
@@ -387,7 +455,13 @@ def run_bnn(
                 prior_val.to(device),
                 use_prior=True,
             )
-            val_loss = total_loss(mean, lower, upper, median, logvar, y_val_tensor.to(device), model, target_weights)
+            val_loss = total_loss(
+                mean, lower, upper, median, logvar, y_val_tensor.to(device), model, target_weights,
+                sharp_scale=0.0,
+                coverage_scale=0.0,
+                over_cov_scale=None,
+                width_scales=width_scales
+            )
 
         print(f"Epoch {epoch+1} - Train Loss: {np.mean(losses):.4f} - Val Loss: {val_loss.item():.4f}")
 

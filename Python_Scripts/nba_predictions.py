@@ -15,7 +15,7 @@ from nba_api.stats.static import players
 import torch
 from Python_Scripts.scraping_loading import run_scrape_and_load
 from Python_Scripts.feature_engineering import run_feature_engineering
-from Python_Scripts.bnn import QuantileBNN, predict_mc
+from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
 
 # ---------------------------------------------------
 # Config
@@ -169,6 +169,9 @@ def main():
     prior_pipeline  = joblib.load("pipelines/prior_pipeline.joblib")
     embed_encoder   = joblib.load("pipelines/embed_encoder.joblib")
     embedding_sizes = joblib.load("pipelines/embedding_sizes.joblib")
+    
+    # use GPU if available, otherwise fall back to CPU
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # embeddings (IDs were +1/clamped in training)
     for col in embedding_features:
@@ -176,38 +179,36 @@ def main():
     Xp_embed = embed_encoder.transform(sched[embedding_features]).astype(np.int64) + 1
     for j, (num_embeddings, _) in enumerate(embedding_sizes):
         Xp_embed[:, j] = np.clip(Xp_embed[:, j], 0, num_embeddings - 1)
-    Xp_embed_tensor = torch.tensor(Xp_embed, dtype=torch.long)
-
+    Xp_embed_tensor = torch.tensor(Xp_embed, dtype=torch.long, device=device)
+    
     # numeric block via training preprocessor
     Xp = sched[preprocessor.named_steps["transform"].feature_names_in_]
     Xp_proc_base = preprocessor.transform(Xp)
     Xp_proc = pd.DataFrame(Xp_proc_base, columns=preprocessor.get_feature_names_out())
-
+    
     # priors (expanding_mean/std for the 6 targets, already in prior_features order)
     Xp_prior = prior_pipeline.transform(sched[prior_features]).astype(np.float32)
-    Xp_prior_tensor = torch.tensor(Xp_prior, dtype=torch.float32)
-
+    Xp_prior_tensor = torch.tensor(Xp_prior, dtype=torch.float32, device=device)
+    
     # final numeric tensor (drop embed cols; there is no 'target' column at inference)
     Xp_num_tensor = torch.tensor(
         Xp_proc.drop(columns=[c for c in embedding_features if c in Xp_proc.columns], errors="ignore").values,
-        dtype=torch.float32
+        dtype=torch.float32,
+        device=device
     )
 
     # ---------------------------------------------------
     # Step 6: BNN model (same architecture as training) + weights
-    #         Aux heads exist in the architecture but are not needed for inference.
-    # ---------------------------------------------------
-    model = QuantileBNN(
+    model = load_bnn_for_inference(
+        weights_path="models/bnn/nba_bnn_weights_only.pt",
         input_dim=Xp_num_tensor.shape[1],
         embedding_sizes=embedding_sizes,
         prior_dim=Xp_prior_tensor.shape[1],
         output_dim=len(targets),
-        aux_dim=len(targets),   # matches training signature; unused during predict_mc
+        aux_dim=len(targets),
+        device=device,
     )
-    state_path = "models/bnn/nba_bnn_weights_only.pt"
-    model.load_state_dict(torch.load(state_path, map_location="cpu"))
-    model.train()   # keep dropout on for MC sampling
-    model.to("cpu")
+    model.train()  # enable dropout for MC sampling
 
     # ---------------------------------------------------
     # Step 7: MC-dropout predictions, then invert scaling
@@ -271,7 +272,7 @@ def main():
     # Step 9: odds scrape for filtering
     # ---------------------------------------------------
     try:
-        API_KEY   = "[redacted]"
+        API_KEY   = "[insert API key]"
         SPORT     = "basketball_nba"
         REGION    = "us"
         BOOKMAKER = "draftkings"

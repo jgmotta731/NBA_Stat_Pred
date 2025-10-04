@@ -66,14 +66,24 @@ def run_feature_engineering(
     cache_has_ids = False
     if cache_read and os.path.exists(save_path):
         fe_cached = pd.read_parquet(save_path)
-
+        all_star_teams = ["DUR", "LEB", "GIA", "WEST", "EAST", "CAN", "CHK", "KEN", "SHQ"]
         in_id = _resolve_idcol(gamelogs, id_col)
         fe_id = _resolve_idcol(fe_cached, id_col)
 
         if in_id and fe_id:
-            cache_has_ids = True
-            incoming_ids = pd.Index(gamelogs[in_id].dropna().astype(str))
-            cached_ids   = pd.Index(fe_cached[fe_id].dropna().astype(str))
+            # 1) Apply the same early FE exclusion to the incoming frame
+            g_in = gamelogs
+            if "team_abbreviation" in g_in.columns:
+                g_in = g_in[~g_in["team_abbreviation"].isin(all_star_teams)]
+        
+            # 2) Compare as integers (no strings)
+            incoming_ids = pd.Index(
+                pd.to_numeric(g_in[in_id], errors="coerce").dropna().astype("int32").unique()
+            )
+            cached_ids = pd.Index(
+                pd.to_numeric(fe_cached[fe_id], errors="coerce").dropna().astype("int32").unique()
+            )
+        
             new_ids = incoming_ids.difference(cached_ids)
             if len(new_ids) == 0:
                 print(f"No new {in_id}s. Loading existing feature parquet and stopping: {save_path}")

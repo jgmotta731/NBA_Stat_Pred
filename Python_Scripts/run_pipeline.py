@@ -19,7 +19,7 @@ from Python_Scripts.clustering import run_clustering
 from Python_Scripts.preprocessing import run_preprocessing
 from Python_Scripts.bnn import run_bnn
 
-pd.set_option('display.max_columns', 20)
+pd.set_option('display.max_columns', None)
 
 def main() -> None:
     # 1) Scrape & load (writes/caches parquets internally)
@@ -39,7 +39,7 @@ def main() -> None:
         show_diagnostics=False,
     )
 
-    # 4) Preprocessing (NOTE: arg name is season_cutoff, not train_season_cutoff)
+    # 4) Preprocessing
     (
         X_train_proc,
         X_val_proc,
@@ -79,7 +79,7 @@ def main() -> None:
         mc_samples=50,
     )
 
-    # Optional: echo results
+    # Echo results
     try:
         print("\n=== Validation metrics ===")
         print(results_df)

@@ -3,16 +3,13 @@
 # Created on Apr 29, 2025
 # Author: Jack Motta
 # ---------------------------------------------------
-import os
-import warnings
-import joblib
-import requests
+import os, warnings, joblib, requests, torch, random
 import numpy as np
 import pandas as pd
 from datetime import date, timedelta
 from unidecode import unidecode
 from nba_api.stats.static import players
-import torch
+from scipy.stats import norm
 from Python_Scripts.scraping_loading import run_scrape_and_load
 from Python_Scripts.feature_engineering import run_feature_engineering
 from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
@@ -21,6 +18,18 @@ from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
 # Config
 # ---------------------------------------------------
 warnings.filterwarnings("ignore")
+
+# Reproducible MC inference (dropout + noise)
+def set_inference_seed(seed: int = 42):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # make GPU math deterministic where possible
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 DATASETS_DIR = "datasets"
 PREDICTIONS_DIR = "predictions"
@@ -59,6 +68,7 @@ FEATURED_PATH     = "datasets/gamelogs_features.parquet"
 SCHEDULE_PATH = f"{DATASETS_DIR}/nba_schedule.parquet"
 GAMELOGS_PATH = f"{DATASETS_DIR}/nba_gamelogs.parquet"
 
+set_inference_seed(42)
 def main():
     # ---------------------------------------------------
     # Step 1: Scrape + load + preprocess (caches to PREPROCESSED_PATH)
@@ -209,31 +219,81 @@ def main():
         device=device,
     )
     model.train()  # enable dropout for MC sampling
-
+    
+    # ---- load calibration scales (STD + Quantile), aligned to `targets` order
+    calib_df = pd.read_parquet("datasets/Calibration_Scales.parquet")
+    calib_vec = (
+        calib_df.set_index("Target")
+                .reindex(targets)["Aleatoric_Scale"]
+                .astype("float32")
+                .to_numpy()
+    )
+    calib_t = torch.tensor(calib_vec, dtype=torch.float32, device=device).view(1, -1)
+    
+    # quantile scales (optional; fall back to 1.0 if missing)
+    try:
+        qcal_df = pd.read_parquet("datasets/Quantile_Calibration_Scales.parquet")
+        q_vec = (
+            qcal_df.set_index("Target")
+                   .reindex(targets)["Quantile_Scale"]
+                   .astype("float32")
+                   .to_numpy()
+        )
+    except Exception:
+        print("Note: Quantile calibration scales not found; using 1.0 (no adjustment).")
+        q_vec = np.ones(len(targets), dtype=np.float32)
+    q_vec_r = q_vec.reshape(1, -1)
+    
     # ---------------------------------------------------
-    # Step 7: MC-dropout predictions, then invert scaling
+    # Step 7: MC-dropout predictions (STD-calibrated), then quantile-calibrate, then invert scaling
     # ---------------------------------------------------
-    mean_pred, std_pred, lower_pred, upper_pred, median_pred = predict_mc(
+    # ---- MC predictions for future games (STD-calibrated via alea_scale) ----
+    mean_pred, std_epi, std_ale, std_pred, q10, q50, q90 = predict_mc(
         model=model,
         X_num=Xp_num_tensor,
         X_embed=Xp_embed_tensor,
         prior_tensor=Xp_prior_tensor,
-        T=50
+        T=50,
+        alea_scale=calib_t,  # <-- STD calibration applied here
     )
-
-    y_scaler        = joblib.load("pipelines/y_scaler.joblib")
-    y_val_mean_unscaled   = y_scaler.inverse_transform(mean_pred)
-    y_val_median_unscaled = y_scaler.inverse_transform(median_pred)
-    y_val_lower_unscaled  = y_scaler.inverse_transform(lower_pred)
-    y_val_upper_unscaled  = y_scaler.inverse_transform(upper_pred)
-
-    pred_df = pd.DataFrame(y_val_mean_unscaled, columns=[f"{t}_mean" for t in targets])
-    pred_df[[f"{t}_lower"  for t in targets]] = y_val_lower_unscaled
-    pred_df[[f"{t}_upper"  for t in targets]] = y_val_upper_unscaled
-    pred_df[[f"{t}_median" for t in targets]] = y_val_median_unscaled
+    
+    # ---- quantile calibration (in standardized space) ----
+    q10 = mean_pred + (q10 - mean_pred) * q_vec_r
+    q90 = mean_pred + (q90 - mean_pred) * q_vec_r
+    # median left as-is (symmetry)
+    
+    # ---- inverse transform to original units ----
+    y_scaler = joblib.load("pipelines/y_scaler.joblib")
+    mean_unscaled   = y_scaler.inverse_transform(mean_pred)
+    median_unscaled = y_scaler.inverse_transform(q50)
+    lower_unscaled  = y_scaler.inverse_transform(q10)
+    upper_unscaled  = y_scaler.inverse_transform(q90)
+    
+    # stds to original units (already STD-calibrated by alea_scale in MC)
+    std_epi_unscaled  = std_epi  * y_scaler.scale_
+    std_ale_unscaled  = std_ale  * y_scaler.scale_
+    std_pred_unscaled = std_pred * y_scaler.scale_
+    
+    # ---- std-based 80% bounds (two-sided) ----
+    critval_80 = norm.ppf(0.9)
+    std80_lower_unscaled = mean_unscaled - critval_80 * std_pred_unscaled
+    std80_upper_unscaled = mean_unscaled + critval_80 * std_pred_unscaled
+    
+    # ---- assemble prediction frame ----
+    pred_df = pd.DataFrame(mean_unscaled, columns=[f"{t}_mean" for t in targets])
+    pred_df[[f"{t}_median"          for t in targets]] = median_unscaled
+    pred_df[[f"{t}_lower"           for t in targets]] = lower_unscaled
+    pred_df[[f"{t}_upper"           for t in targets]] = upper_unscaled
+    pred_df[[f"{t}_std_pred"        for t in targets]] = std_pred_unscaled
+    pred_df[[f"{t}_std_epistemic"   for t in targets]] = std_epi_unscaled
+    pred_df[[f"{t}_std_aleatoric"   for t in targets]] = std_ale_unscaled
+    pred_df[[f"{t}_std80_lower"     for t in targets]] = std80_lower_unscaled
+    pred_df[[f"{t}_std80_upper"     for t in targets]] = std80_upper_unscaled
+    pred_df[[f"{t}_pi80_width"      for t in targets]] = (upper_unscaled - lower_unscaled)
+    
     pred_df["athlete_display_name"] = sched["athlete_display_name"].values
     pred_df["game_id"] = sched.get("game_id", pd.Series(index=sched.index, dtype="object"))
-
+    
     # ---------------------------------------------------
     # Step 8: assemble output rows
     # ---------------------------------------------------
@@ -272,7 +332,7 @@ def main():
     # Step 9: odds scrape for filtering
     # ---------------------------------------------------
     try:
-        API_KEY   = "[insert API key]"
+        API_KEY   = "[insert API Key]"
         SPORT     = "basketball_nba"
         REGION    = "us"
         BOOKMAKER = "draftkings"
@@ -356,13 +416,32 @@ def main():
         "athlete_display_name", "athlete_position_abbreviation",
         "team_abbreviation", "opponent_team_abbreviation",
         "game_date", "home_away", "headshot_url",
+    
         "three_point_field_goals_made_mean", "three_point_field_goals_made_lower",
         "three_point_field_goals_made_upper", "three_point_field_goals_made_median",
+        "three_point_field_goals_made_std_pred", "three_point_field_goals_made_std_epistemic",
+        "three_point_field_goals_made_std_aleatoric", "three_point_field_goals_made_std80_lower",
+        "three_point_field_goals_made_std80_upper", "three_point_field_goals_made_pi80_width",
+    
         "rebounds_mean", "rebounds_lower", "rebounds_upper", "rebounds_median",
+        "rebounds_std_pred", "rebounds_std_epistemic", "rebounds_std_aleatoric",
+        "rebounds_std80_lower", "rebounds_std80_upper", "rebounds_pi80_width",
+    
         "assists_mean", "assists_lower", "assists_upper", "assists_median",
+        "assists_std_pred", "assists_std_epistemic", "assists_std_aleatoric",
+        "assists_std80_lower", "assists_std80_upper", "assists_pi80_width",
+    
         "steals_mean", "steals_lower", "steals_upper", "steals_median",
+        "steals_std_pred", "steals_std_epistemic", "steals_std_aleatoric",
+        "steals_std80_lower", "steals_std80_upper", "steals_pi80_width",
+    
         "blocks_mean", "blocks_lower", "blocks_upper", "blocks_median",
+        "blocks_std_pred", "blocks_std_epistemic", "blocks_std_aleatoric",
+        "blocks_std80_lower", "blocks_std80_upper", "blocks_pi80_width",
+    
         "points_mean", "points_lower", "points_upper", "points_median",
+        "points_std_pred", "points_std_epistemic", "points_std_aleatoric",
+        "points_std80_lower", "points_std80_upper", "points_pi80_width",
     ]
     out = out[cols_to_keep].copy()
     today_str = date.today().strftime("%Y-%m-%d")

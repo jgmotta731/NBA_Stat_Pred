@@ -318,16 +318,16 @@ server <- function(input, output, session) {
     session,
     filePath = "datasets/Evaluation_Metrics.parquet",
     readFunc = function(fp) {
-      arrow::read_parquet(fp) %>% 
-        rename(Coverage_80pct = `80pct_Coverage`)
+      arrow::read_parquet(fp)
     }
   )
   
-  # --- Predictions Table (switch to preds()) ---
+  # --- Predictions Table ---
   output$predictions_table <- renderReactable({
     req(input$selected_columns)
+    
     df <- preds() %>%
-      mutate(
+      dplyr::mutate(
         Player = paste0(
           "<div style='text-align:center;'>",
           "<img src='", headshot_url, "' height='60' style='border-radius:50%;'><br>",
@@ -338,106 +338,152 @@ server <- function(input, output, session) {
         Date     = game_date,
         HomeAway = home_away,
         
-        `3-Point FG (Mean)`   = three_point_field_goals_made_mean,
-        `3-Point FG (Median)` = three_point_field_goals_made_median,
-        `3-Point FG (Lower)`  = three_point_field_goals_made_lower,
-        `3-Point FG (Upper)`  = three_point_field_goals_made_upper,
+        # --- 3-Point FG ---
+        `3-Point FG (Mean)`        = three_point_field_goals_made_mean,
+        `3-Point FG (Median)`      = three_point_field_goals_made_median,
+        `3-Point FG (Lower)`       = three_point_field_goals_made_lower,
+        `3-Point FG (Upper)`       = three_point_field_goals_made_upper,
+        `3-Point FG (Pred Std)`    = three_point_field_goals_made_std_pred,
+        `3-Point FG (Epi Std)`     = three_point_field_goals_made_std_epistemic,
+        `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
+        `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
+        `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper,
+        `3-Point FG (PI80 Width)`  = three_point_field_goals_made_pi80_width,
         
-        `Rebounds (Mean)`   = rebounds_mean,
-        `Rebounds (Median)` = rebounds_median,
-        `Rebounds (Lower)`  = rebounds_lower,
-        `Rebounds (Upper)`  = rebounds_upper,
+        # --- Rebounds ---
+        `Rebounds (Mean)`        = rebounds_mean,
+        `Rebounds (Median)`      = rebounds_median,
+        `Rebounds (Lower)`       = rebounds_lower,
+        `Rebounds (Upper)`       = rebounds_upper,
+        `Rebounds (Pred Std)`    = rebounds_std_pred,
+        `Rebounds (Epi Std)`     = rebounds_std_epistemic,
+        `Rebounds (Ale Std)`     = rebounds_std_aleatoric,
+        `Rebounds (Std80 Lower)` = rebounds_std80_lower,
+        `Rebounds (Std80 Upper)` = rebounds_std80_upper,
+        `Rebounds (PI80 Width)`  = rebounds_pi80_width,
         
-        `Assists (Mean)`   = assists_mean,
-        `Assists (Median)` = assists_median,
-        `Assists (Lower)`  = assists_lower,
-        `Assists (Upper)`  = assists_upper,
+        # --- Assists ---
+        `Assists (Mean)`        = assists_mean,
+        `Assists (Median)`      = assists_median,
+        `Assists (Lower)`       = assists_lower,
+        `Assists (Upper)`       = assists_upper,
+        `Assists (Pred Std)`    = assists_std_pred,
+        `Assists (Epi Std)`     = assists_std_epistemic,
+        `Assists (Ale Std)`     = assists_std_aleatoric,
+        `Assists (Std80 Lower)` = assists_std80_lower,
+        `Assists (Std80 Upper)` = assists_std80_upper,
+        `Assists (PI80 Width)`  = assists_pi80_width,
         
-        `Steals (Mean)`   = steals_mean,
-        `Steals (Median)` = steals_median,
-        `Steals (Lower)`  = steals_lower,
-        `Steals (Upper)`  = steals_upper,
+        # --- Steals ---
+        `Steals (Mean)`        = steals_mean,
+        `Steals (Median)`      = steals_median,
+        `Steals (Lower)`       = steals_lower,
+        `Steals (Upper)`       = steals_upper,
+        `Steals (Pred Std)`    = steals_std_pred,
+        `Steals (Epi Std)`     = steals_std_epistemic,
+        `Steals (Ale Std)`     = steals_std_aleatoric,
+        `Steals (Std80 Lower)` = steals_std80_lower,
+        `Steals (Std80 Upper)` = steals_std80_upper,
+        `Steals (PI80 Width)`  = steals_pi80_width,
         
-        `Blocks (Mean)`   = blocks_mean,
-        `Blocks (Median)` = blocks_median,
-        `Blocks (Lower)`  = blocks_lower,
-        `Blocks (Upper)`  = blocks_upper,
+        # --- Blocks ---
+        `Blocks (Mean)`        = blocks_mean,
+        `Blocks (Median)`      = blocks_median,
+        `Blocks (Lower)`       = blocks_lower,
+        `Blocks (Upper)`       = blocks_upper,
+        `Blocks (Pred Std)`    = blocks_std_pred,
+        `Blocks (Epi Std)`     = blocks_std_epistemic,
+        `Blocks (Ale Std)`     = blocks_std_aleatoric,
+        `Blocks (Std80 Lower)` = blocks_std80_lower,
+        `Blocks (Std80 Upper)` = blocks_std80_upper,
+        `Blocks (PI80 Width)`  = blocks_pi80_width,
         
-        `Points (Mean)`   = points_mean,
-        `Points (Median)` = points_median,
-        `Points (Lower)`  = points_lower,
-        `Points (Upper)`  = points_upper
+        # --- Points ---
+        `Points (Mean)`        = points_mean,
+        `Points (Median)`      = points_median,
+        `Points (Lower)`       = points_lower,
+        `Points (Upper)`       = points_upper,
+        `Points (Pred Std)`    = points_std_pred,
+        `Points (Epi Std)`     = points_std_epistemic,
+        `Points (Ale Std)`     = points_std_aleatoric,
+        `Points (Std80 Lower)` = points_std80_lower,
+        `Points (Std80 Upper)` = points_std80_upper,
+        `Points (PI80 Width)`  = points_pi80_width
       )
     
     df_to_display <- df[, input$selected_columns, drop = FALSE]
     
     col_defs <- list()
-    if ("Player" %in% input$selected_columns)  col_defs$Player  <- colDef(html = TRUE, align = "center", minWidth = 120)
-    if ("Team" %in% input$selected_columns)    col_defs$Team    <- colDef(align = "center", minWidth = 60)
-    if ("Opponent" %in% input$selected_columns)col_defs$Opponent<- colDef(align = "center", minWidth = 100)
-    if ("Date" %in% input$selected_columns)    col_defs$Date    <- colDef(align = "center", minWidth = 90)
-    if ("HomeAway" %in% input$selected_columns)col_defs$HomeAway<- colDef(name = "Home/Away", align = "center", minWidth = 110)
+    if ("Player" %in% names(df_to_display))   col_defs$Player   <- colDef(html = TRUE, align = "center", minWidth = 120)
+    if ("Team" %in% names(df_to_display))     col_defs$Team     <- colDef(align = "center", minWidth = 60)
+    if ("Opponent" %in% names(df_to_display)) col_defs$Opponent <- colDef(align = "center", minWidth = 100)
+    if ("Date" %in% names(df_to_display))     col_defs$Date     <- colDef(align = "center", minWidth = 90)
+    if ("HomeAway" %in% names(df_to_display)) col_defs$HomeAway <- colDef(name = "Home/Away", align = "center", minWidth = 110)
     
-    if ("3-Point FG (Mean)" %in% input$selected_columns)    col_defs[["3-Point FG (Mean)"]]    <- colDef(align = "right")
-    if ("3-Point FG (Median)" %in% input$selected_columns)  col_defs[["3-Point FG (Median)"]]  <- colDef(align = "right")
-    if ("3-Point FG (Lower)" %in% input$selected_columns)   col_defs[["3-Point FG (Lower)"]]   <- colDef(align = "right")
-    if ("3-Point FG (Upper)" %in% input$selected_columns)   col_defs[["3-Point FG (Upper)"]]   <- colDef(align = "right")
-    if ("Rebounds (Mean)" %in% input$selected_columns)      col_defs[["Rebounds (Mean)"]]      <- colDef(align = "right")
-    if ("Rebounds (Median)" %in% input$selected_columns)    col_defs[["Rebounds (Median)"]]    <- colDef(align = "right")
-    if ("Rebounds (Lower)" %in% input$selected_columns)     col_defs[["Rebounds (Lower)"]]     <- colDef(align = "right")
-    if ("Rebounds (Upper)" %in% input$selected_columns)     col_defs[["Rebounds (Upper)"]]     <- colDef(align = "right")
-    if ("Assists (Mean)" %in% input$selected_columns)       col_defs[["Assists (Mean)"]]       <- colDef(align = "right")
-    if ("Assists (Median)" %in% input$selected_columns)     col_defs[["Assists (Median)"]]     <- colDef(align = "right")
-    if ("Assists (Lower)" %in% input$selected_columns)      col_defs[["Assists (Lower)"]]      <- colDef(align = "right")
-    if ("Assists (Upper)" %in% input$selected_columns)      col_defs[["Assists (Upper)"]]      <- colDef(align = "right")
-    if ("Steals (Mean)" %in% input$selected_columns)        col_defs[["Steals (Mean)"]]        <- colDef(align = "right")
-    if ("Steals (Median)" %in% input$selected_columns)      col_defs[["Steals (Median)"]]      <- colDef(align = "right")
-    if ("Steals (Lower)" %in% input$selected_columns)       col_defs[["Steals (Lower)"]]       <- colDef(align = "right")
-    if ("Steals (Upper)" %in% input$selected_columns)       col_defs[["Steals (Upper)"]]       <- colDef(align = "right")
-    if ("Blocks (Mean)" %in% input$selected_columns)        col_defs[["Blocks (Mean)"]]        <- colDef(align = "right")
-    if ("Blocks (Median)" %in% input$selected_columns)      col_defs[["Blocks (Median)"]]      <- colDef(align = "right")
-    if ("Blocks (Lower)" %in% input$selected_columns)       col_defs[["Blocks (Lower)"]]       <- colDef(align = "right")
-    if ("Blocks (Upper)" %in% input$selected_columns)       col_defs[["Blocks (Upper)"]]       <- colDef(align = "right")
-    if ("Points (Mean)" %in% input$selected_columns)        col_defs[["Points (Mean)"]]        <- colDef(align = "right")
-    if ("Points (Median)" %in% input$selected_columns)      col_defs[["Points (Median)"]]      <- colDef(align = "right")
-    if ("Points (Lower)" %in% input$selected_columns)       col_defs[["Points (Lower)"]]       <- colDef(align = "right")
-    if ("Points (Upper)" %in% input$selected_columns)       col_defs[["Points (Upper)"]]       <- colDef(align = "right")
+    # Right-align any numeric stat columns the user selected
+    right_align <- intersect(names(df_to_display), setdiff(names(df_to_display), c("Player","Team","Opponent","Date","HomeAway")))
+    for (nm in right_align) col_defs[[nm]] <- colDef(align = "right")
     
     reactable(
       df_to_display,
+      columns = col_defs,
+      pagination = TRUE,
       searchable = TRUE,
-      pagination = FALSE,
-      filterable = TRUE,
       highlight  = TRUE,
       compact    = TRUE,
-      columns    = col_defs,
-      theme      = reactableTheme(
-        style     = list(background = "#121212"),
-        rowStyle  = list(borderBottom = "1px solid #007AC1")
+      defaultColDef = colDef(minWidth = 110),
+      theme = reactableTheme(
+        style    = list(background = "#121212"),
+        rowStyle = list(borderBottom = "1px solid #007AC1")
       )
     )
   })
   
-  # --- Metrics Table (switch to metrics()) ---
   output$metrics_table <- renderReactable({
-    m <- metrics() %>% 
-      rename(Metric = target, RMSE = rmse, R2 = r2)
+    m <- metrics() %>%
+      dplyr::filter(Suffix == "cal") %>%
+      dplyr::select(
+        Target, RMSE_Mean, MAE_Mean, R2, RMSE_Median, MAE_Median,
+        Pinball_10, Pinball_50, Pinball_90,
+        PI80_Coverage, PI80_Width,
+        Below_Q10_Rate, Above_Q50_Rate, Above_Q90_Rate,
+        STD80_Coverage,
+        STD_Predictive_Mean, STD_Epistemic_Mean, STD_Aleatoric_Mean,
+        Bias_MeanError, Uncert_Error_Corr
+      )
+    
     reactable(
       m,
       pagination = FALSE,
       highlight = TRUE,
       compact = TRUE,
       columns = list(
-        Metric = colDef(name="Target", align="left"),
-        RMSE_Mean   = colDef(format=colFormat(digits=1), align="right"),
-        MAE_Mean    = colDef(name="MAE", format=colFormat(digits=1), align="right"),
-        R2          = colDef(name="R²", format=colFormat(digits=2), align="right"),
-        RMSE_Median = colDef(name="RMSE (Median)", format=colFormat(digits=1), align="right"),
-        MAE_Median  = colDef(name="MAE (Median)",  format=colFormat(digits=1), align="right"),
-        Pinball_50  = colDef(name="Pinball Loss (τ=0.5)", format=colFormat(digits=1), align="right"),
-        Pinball_10  = colDef(name="Pinball Loss (τ=0.1)", format=colFormat(digits=1), align="right"),
-        Pinball_90  = colDef(name="Pinball Loss (τ=0.9)", format=colFormat(digits=1), align="right"),
-        Coverage_80pct = colDef(name="80% PI Coverage", format=colFormat(percent=TRUE, digits=0), align="right")
+        Target = colDef(name = "Target", align = "left"),
+        
+        RMSE_Mean   = colDef(name = "RMSE (Mean)",   format = colFormat(digits = 1), align = "right"),
+        MAE_Mean    = colDef(name = "MAE (Mean)",    format = colFormat(digits = 1), align = "right"),
+        R2          = colDef(name = "R²",            format = colFormat(digits = 2), align = "right"),
+        RMSE_Median = colDef(name = "RMSE (Median)", format = colFormat(digits = 1), align = "right"),
+        MAE_Median  = colDef(name = "MAE (Median)",  format = colFormat(digits = 1), align = "right"),
+        
+        Pinball_10  = colDef(name = "Pinball Loss (q=0.10)", format = colFormat(digits = 2), align = "right"),
+        Pinball_50  = colDef(name = "Pinball Loss (q=0.50)", format = colFormat(digits = 2), align = "right"),
+        Pinball_90  = colDef(name = "Pinball Loss (q=0.90)", format = colFormat(digits = 2), align = "right"),
+        
+        PI80_Coverage   = colDef(name = "80% PI Coverage (q10–q90)", format = colFormat(percent = TRUE, digits = 0), align = "right"),
+        PI80_Width      = colDef(name = "PI80 Width",                   format = colFormat(digits = 2), align = "right"),
+        
+        Below_Q10_Rate  = colDef(name = "Below q10 Rate", format = colFormat(percent = TRUE, digits = 0), align = "right"),
+        Above_Q50_Rate  = colDef(name = "Above q50 Rate", format = colFormat(percent = TRUE, digits = 0), align = "right"),
+        Above_Q90_Rate  = colDef(name = "Above q90 Rate", format = colFormat(percent = TRUE, digits = 0), align = "right"),
+        
+        STD80_Coverage      = colDef(name = "STD 80% Coverage (± z*std)", format = colFormat(percent = TRUE, digits = 0), align = "right"),
+        STD_Predictive_Mean = colDef(name = "Mean Std (Predictive)",        format = colFormat(digits = 2), align = "right"),
+        STD_Epistemic_Mean  = colDef(name = "Mean Std (Epistemic)",         format = colFormat(digits = 2), align = "right"),
+        STD_Aleatoric_Mean  = colDef(name = "Mean Std (Aleatoric)",         format = colFormat(digits = 2), align = "right"),
+        
+        Bias_MeanError     = colDef(name = "Bias (Mean Error)",      format = colFormat(digits = 2), align = "right"),
+        Uncert_Error_Corr  = colDef(name = "Uncertainty–Error Corr", format = colFormat(digits = 2), align = "right")
       ),
       theme = reactableTheme(
         style    = list(background = "#121212"),
@@ -448,6 +494,6 @@ server <- function(input, output, session) {
 }
 
 # ---------------------------------------------------
-# Run the app (UNCHANGED)
+# Run the app
 # ---------------------------------------------------
 shinyApp(ui, server)

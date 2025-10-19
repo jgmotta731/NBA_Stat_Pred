@@ -177,6 +177,7 @@ ui <- tagList(
         
         h4("Uncertainty Columns (per stat)"),
         tags$ul(
+          tags$li(tags$b("Mean"), ": Expected value of the stat."),
           tags$li(tags$b("Median"), ": 50th percentile."),
           tags$li(tags$b("Lower (q10)"), ": 10th percentile — closer to mean ⇒ tighter, much lower ⇒ more downside risk."),
           tags$li(tags$b("Upper (q90)"), ": 90th percentile — much higher than mean ⇒ more upside spread."),

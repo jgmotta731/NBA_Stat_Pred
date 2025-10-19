@@ -13,6 +13,133 @@ library(stringr)
 library(tibble)
 library(parallel)
 
+.stats_season_str <- function(d) {
+  yr <- as.integer(format(as.Date(d), "%Y"))
+  sprintf("%d-%02d", yr, (yr + 1) %% 100)   # e.g., 2025-26
+}
+
+stats_schedule_first_gameday <- function(
+    anchor_date    = NULL,          # NULL -> later of today and Oct 21 (current year)
+    max_days_ahead = 365,
+    sleep_sec      = 0.2,
+    verbose        = TRUE
+){
+  if (is.null(anchor_date) || is.na(anchor_date)) {
+    yr    <- as.integer(format(Sys.Date(), "%Y"))
+    oct21 <- as.Date(sprintf("%04d-10-21", yr))
+    anchor_date <- max(Sys.Date(), oct21)
+  } else {
+    anchor_date <- as.Date(anchor_date)
+  }
+  if (!inherits(anchor_date, "Date")) stop("anchor_date must be a Date or YYYY-MM-DD string")
+  
+  get_abbr_map <- function(team_ids, day) {
+    season <- .stats_season_str(day)
+    ids <- unique(as.character(team_ids))
+    map_dfr(ids, function(tid) {
+      info <- try(hoopR::nba_teaminfocommon(team_id = tid, season = season), silent = TRUE)
+      if (inherits(info, "try-error") || is.null(info$TeamInfoCommon) || !nrow(info$TeamInfoCommon)) {
+        tibble(TEAM_ID = tid, TEAM_ABBREVIATION = NA_character_)
+      } else {
+        info$TeamInfoCommon %>%
+          transmute(TEAM_ID = as.character(TEAM_ID),
+                    TEAM_ABBREVIATION = TEAM_ABBREVIATION)
+      }
+    }) %>% distinct()
+  }
+  
+  for (i in 0:max_days_ahead) {
+    day     <- anchor_date + i
+    day_str <- format(day, "%Y-%m-%d")
+    
+    x <- try(hoopR::nba_scoreboardv2(game_date = day_str), silent = TRUE)
+    if (inherits(x, "try-error") || is.null(x$GameHeader) || !nrow(x$GameHeader)) {
+      if (verbose) message("… ", day_str, " (no games / NULL)")
+      next
+    }
+    
+    gh <- x$GameHeader
+    
+    if (!is.null(x$LineScore) && nrow(x$LineScore)) {
+      ls_abbr <- x$LineScore %>%
+        transmute(
+          GAME_ID = as.character(GAME_ID),
+          TEAM_ID = as.character(TEAM_ID),
+          TEAM_ABBREVIATION
+        )
+      
+      out <- gh %>%
+        mutate(
+          GAME_ID         = as.character(GAME_ID),
+          HOME_TEAM_ID    = as.character(HOME_TEAM_ID),
+          VISITOR_TEAM_ID = as.character(VISITOR_TEAM_ID)
+        ) %>%
+        left_join(ls_abbr %>% rename(HOME_TEAM_ID = TEAM_ID,  home_abbr = TEAM_ABBREVIATION),
+                  by = c("GAME_ID","HOME_TEAM_ID")) %>%
+        left_join(ls_abbr %>% rename(VISITOR_TEAM_ID = TEAM_ID, away_abbr = TEAM_ABBREVIATION),
+                  by = c("GAME_ID","VISITOR_TEAM_ID")) %>%
+        transmute(
+          game_date = as.Date(day_str),
+          game_id   = as.character(GAME_ID),
+          away_id   = VISITOR_TEAM_ID,
+          home_id   = HOME_TEAM_ID,
+          away_abbr, home_abbr,
+          status    = GAME_STATUS_TEXT,
+          arena     = ARENA_NAME
+        ) %>% distinct()
+    } else {
+      abbr_map <- get_abbr_map(c(gh$HOME_TEAM_ID, gh$VISITOR_TEAM_ID), day)
+      out <- gh %>%
+        mutate(
+          GAME_ID         = as.character(GAME_ID),
+          HOME_TEAM_ID    = as.character(HOME_TEAM_ID),
+          VISITOR_TEAM_ID = as.character(VISITOR_TEAM_ID)
+        ) %>%
+        left_join(abbr_map %>% rename(HOME_TEAM_ID    = TEAM_ID, home_abbr = TEAM_ABBREVIATION), by = "HOME_TEAM_ID") %>%
+        left_join(abbr_map %>% rename(VISITOR_TEAM_ID = TEAM_ID, away_abbr = TEAM_ABBREVIATION), by = "VISITOR_TEAM_ID") %>%
+        transmute(
+          game_date = as.Date(day_str),
+          game_id   = as.character(GAME_ID),   # <-- FIXED
+          away_id   = VISITOR_TEAM_ID,
+          home_id   = HOME_TEAM_ID,
+          away_abbr, home_abbr,
+          status    = GAME_STATUS_TEXT,
+          arena     = ARENA_NAME
+        ) %>% distinct()
+    }
+    
+    if (verbose) message("✓ ", day_str, " — ", nrow(out), " game(s)")
+    if (sleep_sec > 0) Sys.sleep(sleep_sec)
+    return(out)
+  }
+  
+  tibble()
+}
+
+# Helper: 0 = regular season (before Apr 12), 1 = playoffs (Apr 12 .. Sep 30)
+is_playoff_flag <- function(dates, playoff_day = "04-12", next_season_day = "10-01") {
+  dates <- as.Date(dates)
+  yr  <- as.integer(format(dates, "%Y"))
+  mo  <- as.integer(format(dates, "%m"))
+  
+  # Season starts in Oct; so for Jan–Sep we're in the season that started the prior year
+  season_start_year <- yr - ifelse(mo < 10L, 1L, 0L)
+  
+  playoff_start      <- as.Date(paste0(season_start_year + 1L, "-", playoff_day))
+  next_season_start  <- as.Date(paste0(season_start_year + 1L, "-", next_season_day))
+  
+  # Flag 1 from Apr 12 (inclusive) until Oct 1 (exclusive)
+  as.integer(dates >= playoff_start & dates < next_season_start)
+}
+
+# Usage with your tibble
+next_slate <- stats_schedule_first_gameday() %>%
+  mutate(is_playoff = is_playoff_flag(game_date)) %>%
+  rename(home_abbreviation = home_abbr,
+         away_abbreviation = away_abbr) %>%
+  select(game_date, home_abbreviation, away_abbreviation, is_playoff)
+
+
 # Player Gamelogs
 player_raw <- load_nba_player_box(
   seasons = 2022:as.numeric(format(Sys.Date(), "%Y"))) %>%
@@ -46,7 +173,8 @@ schedule <- load_nba_schedule(as.numeric(format(Sys.Date(), "%Y"))) %>%
 
 # Save files
 write_parquet(player_raw, "datasets/nba_gamelogs.parquet")
-write_parquet(schedule, "datasets/nba_schedule.parquet")
+#write_parquet(schedule, "datasets/nba_schedule.parquet")
+write_parquet(next_slate, "datasets/nba_schedule.parquet")
 
 # Clear memory
 rm(list = intersect(ls(), c("player_raw","schedule")))

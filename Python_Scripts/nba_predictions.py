@@ -3,20 +3,30 @@
 # Created on Apr 29, 2025
 # Author: Jack Motta
 # ---------------------------------------------------
-import os, warnings, joblib, requests, torch, random
+import os, warnings, joblib, requests, torch, random, sys
 import numpy as np
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date
 from unidecode import unidecode
 from nba_api.stats.static import players
 from scipy.stats import norm
 from Python_Scripts.scraping_loading import run_scrape_and_load
 from Python_Scripts.feature_engineering import run_feature_engineering
 from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
+from pathlib import Path
 
 # ---------------------------------------------------
 # Config
 # ---------------------------------------------------
+# Project root = one level above Python_Scripts
+ROOT = Path(__file__).resolve().parents[1]
+DATASETS_DIR = str(ROOT / "datasets")
+PREDICTIONS_DIR = str(ROOT / "predictions")
+os.makedirs(DATASETS_DIR, exist_ok=True)
+os.makedirs(PREDICTIONS_DIR, exist_ok=True)
+
+SCHEDULE_PATH = str(Path(DATASETS_DIR) / "nba_schedule.parquet")
+GAMELOGS_PATH = str(Path(DATASETS_DIR) / "nba_gamelogs.parquet")
 warnings.filterwarnings("ignore")
 
 # Reproducible MC inference (dropout + noise)
@@ -30,11 +40,6 @@ def set_inference_seed(seed: int = 42):
     # make GPU math deterministic where possible
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-DATASETS_DIR = "datasets"
-PREDICTIONS_DIR = "predictions"
-os.makedirs(DATASETS_DIR, exist_ok=True)
-os.makedirs(PREDICTIONS_DIR, exist_ok=True)
 
 def current_season_bounds(today=None):
     """
@@ -62,7 +67,7 @@ def build_seasons(first_start_year=2021):
     return labels
 
 SEASONS = build_seasons(first_start_year=2021)
-SEASONS = ["2021-22", "2022-23", "2023-24", "2024-25", "2025-2026"]
+SEASONS = ["2021-22", "2022-23", "2023-24", "2024-25", "2025-26"]
 PREPROCESSED_PATH = "datasets/gamelogs_ready_for_fe.parquet"
 FEATURED_PATH     = "datasets/gamelogs_features.parquet"
 SCHEDULE_PATH = f"{DATASETS_DIR}/nba_schedule.parquet"
@@ -232,7 +237,7 @@ def main():
     
     # quantile scales (optional; fall back to 1.0 if missing)
     try:
-        qcal_df = pd.read_parquet("datasets/Quantile_Calibration_Scales.parquet")
+        qcal_df = pd.read_parquet("datasets/Calibration_Scales.parquet")
         q_vec = (
             qcal_df.set_index("Target")
                    .reindex(targets)["Quantile_Scale"]
@@ -240,7 +245,7 @@ def main():
                    .to_numpy()
         )
     except Exception:
-        print("Note: Quantile calibration scales not found; using 1.0 (no adjustment).")
+        print("Note: Calibration scales not found; using 1.0 (no adjustment).")
         q_vec = np.ones(len(targets), dtype=np.float32)
     q_vec_r = q_vec.reshape(1, -1)
     
@@ -297,24 +302,42 @@ def main():
     # ---------------------------------------------------
     # Step 8: assemble output rows
     # ---------------------------------------------------
+    # keep sched clean; DO NOT concat pred_df here (avoids duplicate column names)
     sched = sched.reset_index(drop=True)
-    sched = pd.concat([sched, pred_df], axis=1)
-
+    
     df = sched[[
         "athlete_display_name", "athlete_position_abbreviation",
         "team_abbreviation", "opponent_team_abbreviation",
         "game_date", "home_away"
     ]].reset_index(drop=True)
-
+    
+    # add the prediction columns (without duplicate key columns)
     df = pd.concat(
-        [df, pred_df.drop(columns=["athlete_display_name", "game_id"]).reset_index(drop=True)],
+        [df, pred_df.drop(columns=["athlete_display_name", "game_id"], errors="ignore").reset_index(drop=True)],
         axis=1
     )
+    
+    # if any duplicate column names slipped in, drop the duplicates
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    today = date.today()
-    start = pd.to_datetime(today - timedelta(days=today.weekday()))
-    end   = start + timedelta(days=6)
-    df = df[(df.game_date >= start) & (df.game_date <= end)]
+    # choose the earliest upcoming game_date >= today (or fallback to last available)
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    today_ts = pd.Timestamp.today().normalize()
+    future_mask = df["game_date"] >= today_ts
+    
+    if future_mask.any():
+        next_date = df.loc[future_mask, "game_date"].min()
+        df = df[df["game_date"] == next_date].copy()
+        print(f"Using next slate: {next_date.date()} (rows={len(df)})")
+    else:
+        # no future games in schedule — keep the most recent available date instead
+        if df["game_date"].notna().any():
+            last_date = df["game_date"].max()
+            df = df[df["game_date"] == last_date].copy()
+            print(f"No future games; using last available slate: {last_date.date()} (rows={len(df)})")
+        else:
+            print("No valid game_date values; keeping df as-is.")
+    
     df = df.sort_values("game_date").drop_duplicates("athlete_display_name", keep="first")
     df["game_date"] = df["game_date"].dt.strftime("%Y-%m-%d")
 
@@ -332,7 +355,7 @@ def main():
     # Step 9: odds scrape for filtering
     # ---------------------------------------------------
     try:
-        API_KEY   = "[insert API Key]"
+        API_KEY   = "[insert Odds API Key]"
         SPORT     = "basketball_nba"
         REGION    = "us"
         BOOKMAKER = "draftkings"
@@ -443,11 +466,28 @@ def main():
         "points_std_pred", "points_std_epistemic", "points_std_aleatoric",
         "points_std80_lower", "points_std80_upper", "points_pi80_width",
     ]
+    
+    # hard stop if no rows
+    if out.empty:
+        print("ERROR: No rows in `out` — aborting save.")
+        sys.exit(1)
+    
+    # hard stop if any required column is missing
+    missing = [c for c in cols_to_keep if c not in out.columns]
+    if missing:
+        print("ERROR: Missing required columns:", missing)
+        print("Present columns:", list(out.columns))
+        sys.exit(1)
+    
+    # only keep required columns
     out = out[cols_to_keep].copy()
-    today_str = date.today().strftime("%Y-%m-%d")
+    
+    os.makedirs(PREDICTIONS_DIR, exist_ok=True)  # no-op if it already exists
+    today_str   = date.today().strftime("%Y-%m-%d")  # ISO with dashes
     output_path = f"{PREDICTIONS_DIR}/nba_predictions_{today_str}.parquet"
-    out.to_parquet(output_path, index=False)
-    print(f"Saved {output_path}")
+    out.to_parquet(output_path, index=False)  # overwrites if present
+    print(f"Saved {output_path} (rows={len(out)})")
+
 
 if __name__ == "__main__":
     main()

@@ -13,19 +13,35 @@ library(sortable)
 # Load Data Helpers
 # ---------------------------------------------------
 # Paths via env (fallback to defaults if not set)
-PREDICTIONS_DIR <- Sys.getenv("PREDICTIONS_DIR", "predictions")
-METRICS_PATH    <- Sys.getenv("METRICS_PATH", "datasets/Evaluation_Metrics.parquet")
-
-latest_predictions_path <- function(
-  dir = PREDICTIONS_DIR,
-  pattern = "^nba_predictions_\\d{4}-\\d{2}-\\d{2}\\.parquet$"
-) {
-  if (!dir.exists(dir)) return(NA_character_)
-  files <- list.files(dir, full.names = TRUE, pattern = pattern)
-  if (length(files) == 0) return(NA_character_)
-  info <- file.info(files)
-  files[which.max(info$mtime)]
+metrics_env <- Sys.getenv("METRICS_PATH")
+if (nzchar(metrics_env)) {
+  METRICS_PATH <- normalizePath(metrics_env, winslash = "/", mustWork = TRUE)
+} else {
+  wd <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+  if (basename(wd) == "R_Scripts") {
+    METRICS_PATH <- normalizePath(file.path(wd, "..", "datasets", "Evaluation_Metrics.parquet"),
+                                  winslash = "/", mustWork = TRUE)
+  } else {
+    METRICS_PATH <- normalizePath(file.path(wd, "datasets", "Evaluation_Metrics.parquet"),
+                                  winslash = "/", mustWork = TRUE)
+  }
 }
+
+pred_dir_env <- Sys.getenv("PREDICTIONS_DIR")
+if (nzchar(pred_dir_env)) {
+  PREDICTIONS_DIR <- normalizePath(pred_dir_env, winslash = "/", mustWork = TRUE)
+} else {
+  wd <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+  # If running the app from R_Scripts/, go up one level
+  if (basename(wd) == "R_Scripts") {
+    PREDICTIONS_DIR <- normalizePath(file.path(wd, "..", "predictions"), winslash = "/", mustWork = TRUE)
+  } else {
+    PREDICTIONS_DIR <- normalizePath(file.path(wd, "predictions"), winslash = "/", mustWork = TRUE)
+  }
+}
+
+today_str  <- format(Sys.Date(), "%Y-%m-%d")
+latest_prediction_path <- file.path(PREDICTIONS_DIR, paste0("nba_predictions_", today_str, ".parquet"))
 
 # ---------------------------------------------------
 # Theme (UNCHANGED)
@@ -172,11 +188,6 @@ ui <- tagList(
               class = "card",
               style = "background:#1e1e1e; border:1px solid #007AC1; padding:1rem;",
               h2("Weekly Player Predictions", style = "color:white;"),
-              div(
-                class = "text-muted",
-                style = "font-size:0.9rem; margin-top:-0.5rem; margin-bottom:0.75rem;",
-                HTML("<em>Note:</em> “Lower” refers to the 10th percentile and “Upper” refers to the 90th percentile.")
-              ),
               reactableOutput("predictions_table")
             )
           )
@@ -190,71 +201,152 @@ ui <- tagList(
       div(
         class = "container-fluid",
         style = "padding:0rem; background:#121212;",
-        
-        h4("How to Interpret These Metrics", style = "color:#FFFFFF;"),
-        
-        # Mean-based accuracy
-        p(
-          style = "color:#DDDDDD;",
-          strong("Root Mean Squared Error (RMSE):"),
-          "Measures the typical size of prediction errors, giving extra weight to large mistakes. ",
-          "A higher RMSE suggests occasional big misses are present."
-        ),
-        p(
-          style = "color:#DDDDDD;",
-          strong("Mean Absolute Error (MAE):"),
-          "Measures the average size of all prediction errors, treating every miss equally. ",
-          "A lower MAE means the model is consistently close, even if not perfect."
-        ),
-        
-        # Variance explained
-        p(
-          style = "color:#DDDDDD;",
-          strong("R-squared (R²):"),
-          "Proportion of variance explained. An R² of 0.5 means we capture about half of the ",
-          "game-to-game variability. Shows how much better the model is at predicting compared ",
-          "to simply guessing the average every time."
-        ),
-        
-        # Pinball Loss
-        p(
-          style = "color:#DDDDDD;",
-          strong("Pinball Loss (τ = 0.1):"),
-          "Measures how well the model predicts the 10th percentile. ",
-          "A lower value means the model is effectively avoiding over-predictions, ",
-          "making it useful for conservative forecasting."
-        ),
-        p(
-          style = "color:#DDDDDD;",
-          strong("Pinball Loss (τ = 0.5):"),
-          "Measures how well the model predicts the 50th percentile (median). ",
-          "A lower value indicates the median predictions are closely aligned with actual outcomes."
-        ),
-        p(
-          style = "color:#DDDDDD;",
-          strong("Pinball Loss (τ = 0.9):"),
-          "Measures how well the model predicts the 90th percentile. ",
-          "A lower value here means the model is good at avoiding under-predictions, ",
-          "useful for capturing upper-bound expectations."
-        ),
-        
-        # Prediction interval coverage
-        p(
-          style = "color:#DDDDDD;",
-          strong("80% Prediction Interval Coverage:"),
-          "Share of games where the actual value fell within the model’s 80% prediction interval (10th to 90th percentile). ",
-          "Values near 80% indicate well-calibrated intervals; much higher suggests intervals are too wide, ",
-          "much lower suggests they’re too narrow."
-        ),
-        
+        h2("Model Metrics", style = "color:#FFFFFF;"),
         reactableOutput("metrics_table"),
-        
         div(
           style = "text-align:center; margin-top:2rem; margin-bottom:2rem;",
           tags$img(
             src = "nba_dark.png",
             style = "max-width:420px; height: auto; width:100%;"
           )
+        )
+      )
+    ),
+    # --- GUIDE TAB (glossary / how to interpret) ---
+    tabPanel(
+      "Guide",
+      div(
+        class = "container-fluid",
+        style = "padding:2rem; background:#121212; color:#FFFFFF;",
+        
+        h2("How to Interpret Predictions & Metrics"),
+        p(class = "text-muted",
+          style = "color:#BBBBBB;",
+          "This page explains all prediction columns and evaluation metrics used in the app."
+        ),
+        tags$hr(style = "border-top: 1px solid #007AC1;"),
+        
+        # =========================
+        # Predicted Stats
+        # =========================
+        h3("Predicted Stats"),
+        p("Each stat is predicted for the player's next game."),
+        tags$ul(
+          tags$li(tags$b("3-Point FG"), ": Predicted three-pointers made (not attempted)."),
+          tags$li(tags$b("Rebounds"), ": Total rebounds (offensive + defensive)."),
+          tags$li(tags$b("Assists"), ": Recorded assists."),
+          tags$li(tags$b("Steals"), ": Recorded steals."),
+          tags$li(tags$b("Blocks"), ": Recorded blocks."),
+          tags$li(tags$b("Points"), ": Total points scored.")
+        ),
+        
+        h4("Uncertainty Columns (per stat)"),
+        tags$ul(
+          tags$li(tags$b("Mean"), ": Expected value of the stat."),
+          tags$li(tags$b("Median"), ": 50th percentile (middle of the distribution). ",
+                  "If Mean and Median differ a lot, the distribution may be skewed."),
+          
+          tags$li(tags$b("Lower (q10)"), ": 10th percentile. ",
+                  tags$em("Closer to Mean → "), "tighter, less downside risk. ",
+                  tags$em("Much lower than Mean → "), "more downside risk / uncertainty."),
+          
+          tags$li(tags$b("Upper (q90)"), ": 90th percentile. ",
+                  tags$em("Much higher than Mean → "), "larger upside / uncertainty. ",
+                  tags$em("Closer to Mean → "), "tighter, less upside spread."),
+          
+          tags$li(tags$b("Pred Std"), ": Total predictive std (", tags$em("epistemic + aleatoric"), "). ",
+                  tags$em("High: "), "outcomes may vary widely (be cautious). ",
+                  tags$em("Low: "), "outcomes expected to be consistent (more confidence)."),
+          
+          tags$li(tags$b("Epi Std"), ": Epistemic uncertainty (what the model doesn’t know yet). ",
+                  tags$em("High: "), "limited/new context (role change, injuries, small samples). ",
+                  tags$em("Low: "), "model is well-trained for this context."),
+          
+          tags$li(tags$b("Ale Std"), ": Aleatoric uncertainty (inherent randomness). ",
+                  tags$em("High: "), "stat/matchup is volatile (e.g., stocks like blocks/steals). ",
+                  tags$em("Low: "), "intrinsically steadier environment."),
+          
+          tags$li(tags$b("Std80 Lower / Std80 Upper"),
+                  ": 80% interval via ±1.2816 × Pred Std. ",
+                  tags$em("Wider → "), "more uncertainty; ",
+                  tags$em("Narrower → "), "more confidence."),
+          
+          tags$li(tags$b("PI80 Width"),
+                  ": Width of the 10–90% interval (Upper − Lower). ",
+                  tags$em("High: "), "bigger range of plausible outcomes; ",
+                  tags$em("Low: "), "tighter expectation.")
+        ),
+        
+        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
+        
+        # =========================
+        # Metrics
+        # =========================
+        h3("Metrics"),
+        p("Computed on historical data to judge calibration and accuracy."),
+        tags$ul(
+          tags$li(tags$b("RMSE (Mean)"),
+                  ": Root Mean Squared Error using mean predictions. ",
+                  tags$em("Lower is better; punishes big misses.")),
+          
+          tags$li(tags$b("MAE (Mean)"),
+                  ": Mean Absolute Error using mean predictions. ",
+                  tags$em("Lower is better; typical miss size.")),
+          
+          tags$li(tags$b("R²"),
+                  ": Variance explained vs a constant baseline. ",
+                  tags$em("Higher is better.")),
+          
+          tags$li(tags$b("RMSE / MAE (Median)"),
+                  ": Same error metrics but for median predictions. ",
+                  tags$em("Lower is better.")),
+          
+          tags$li(tags$b("Pinball Loss (q=0.10 / 0.50 / 0.90)"),
+                  ": Quantile loss at 10th / 50th / 90th percentiles. ",
+                  tags$em("Lower is better; quantile accuracy.")),
+          
+          tags$li(tags$b("80% PI Coverage (q10–q90)"),
+                  ": Share of actuals inside the 10–90% interval. ",
+                  tags$em("Desirable ≈ 80%; "),
+                  "much higher → intervals too wide, much lower → too narrow."),
+          
+          tags$li(tags$b("PI80 Width"),
+                  ": Average width of the 10–90% interval. ",
+                  tags$em("Lower is tighter"), " — but balance with Coverage (avoid under-covering)."),
+          
+          tags$li(tags$b("Below q10 / Above q50 / Above q90 Rates"),
+                  ": Empirical tail frequencies. ",
+                  tags$em("Targets ≈ 10% / 50% / 10%; "),
+                  "persistent deviation → miscalibration."),
+          
+          tags$li(tags$b("STD 80% Coverage (± z·std)"),
+                  ": Coverage when intervals use ±1.2816 × Pred Std. ",
+                  tags$em("≈ 80% indicates std is well-scaled.")),
+          
+          tags$li(tags$b("Mean Std (Predictive / Epistemic / Aleatoric)"),
+                  ": Averages of std components across games. ",
+                  tags$em("Lower → "), "more confidence; ",
+                  tags$em("Higher → "), "more uncertainty (check calibration)."),
+          
+          tags$li(tags$b("Bias (Mean Error)"),
+                  ": Average (prediction − actual). ",
+                  tags$em("Closer to 0 is better; sign shows over/under-prediction.")),
+          
+          tags$li(tags$b("Uncertainty–Error Corr"),
+                  ": Correlation between predicted uncertainty and absolute error. ",
+                  tags$em("Positive is desirable: "),
+                  "the model is more uncertain when it tends to miss more.")
+        ),
+        
+        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
+        
+        h4("Quick Tips"),
+        tags$ul(
+          tags$li("For conservative plays, focus on ", tags$b("Lower (q10)"), " and a small ", tags$b("PI80 Width"), "."),
+          tags$li("If ", tags$b("Pred Std"), " is high, check whether it’s driven by ",
+                  tags$b("Epi Std"), " (limited/shifted data) or ",
+                  tags$b("Ale Std"), " (inherent volatility)."),
+          tags$li("Good calibration: Coverage near 80% and tail rates near 10% / 50% / 10%.")
         )
       )
     )
@@ -285,41 +377,33 @@ server <- function(input, output, session) {
   # --- Reactive: Predictions via reactivePoll() ---
   # Poll every 10 minutes for either a NEW file (date rollover) or a modified mtime
   preds <- reactivePoll(
-    600000,   # 10 minutes in ms
-    session,
+    600000, session,
     checkFunc = function() {
-      path <- latest_predictions_path()
-      if (is.na(path)) return("")        # nothing to load yet
-      fi <- file.info(path)
-      # Return "path mtime size" so changes in file or contents trigger updates.
-      paste(path, as.numeric(fi$mtime), fi$size)
+      if (!file.exists(latest_prediction_path)) "" else {
+        fi <- file.info(latest_prediction_path)
+        paste(as.numeric(fi$mtime), fi$size)
+      }
     },
     valueFunc = function() {
-      path <- latest_predictions_path()
-      validate(need(!is.na(path), sprintf("No predictions parquet found yet in '%s'.", PREDICTIONS_DIR)))
-      # try-catch in case file is mid-write when polled
-      tryCatch({
-        arrow::read_parquet(path) |>
-          dplyr::mutate(
-            dplyr::across(where(is.numeric), ~ round(.x, 1)),
-            home_away = stringr::str_to_sentence(home_away)
-          ) |>
-          dplyr::arrange(game_date, team_abbreviation, athlete_display_name)
-      }, error = function(e) {
-        validate(need(FALSE, paste("Failed to read predictions:", conditionMessage(e))))
-      })
+      validate(need(file.exists(latest_prediction_path),
+                    paste("Missing file:", latest_prediction_path)))
+      arrow::read_parquet(latest_prediction_path) |>
+        dplyr::mutate(
+          dplyr::across(where(is.numeric), ~ round(.x, 1)),
+          home_away = stringr::str_to_sentence(home_away)
+        ) |>
+        dplyr::arrange(game_date, team_abbreviation, athlete_display_name)
     }
   )
+
   
   # --- Reactive: Metrics via reactiveFileReader() ---
   # Auto-reloads when datasets/Evaluation_Metrics.parquet is updated
   metrics <- reactiveFileReader(
     86400000, # daily
     session,
-    filePath = "datasets/Evaluation_Metrics.parquet",
-    readFunc = function(fp) {
-      arrow::read_parquet(fp)
-    }
+    filePath = METRICS_PATH,
+    readFunc = function(fp) arrow::read_parquet(fp)
   )
   
   # --- Predictions Table ---
@@ -411,18 +495,32 @@ server <- function(input, output, session) {
         `Points (PI80 Width)`  = points_pi80_width
       )
     
-    df_to_display <- df[, input$selected_columns, drop = FALSE]
+    # 1) Expand group labels to actual columns by prefix match
+    meta <- c("Player","Team","Opponent","Date","HomeAway")
+    selected_meta   <- intersect(input$selected_columns, meta)
+    selected_stats  <- setdiff(input$selected_columns, meta)
     
+    # Find all columns that start with "<label> (" (e.g., "3-Point FG (Mean)")
+    stat_cols <- unlist(lapply(
+      selected_stats,
+      function(lbl) grep(paste0(lbl, " ("), names(df), value = TRUE, fixed = TRUE)
+    ), use.names = FALSE)
+    
+    display_cols <- c(selected_meta, stat_cols)
+    req(length(display_cols) > 0)  # don’t render if nothing chosen
+    
+    df_to_display <- df[, display_cols, drop = FALSE]
+    
+    # 2) Column defs — keep yours, this just right-aligns numeric stats
     col_defs <- list()
-    if ("Player" %in% names(df_to_display))   col_defs$Player   <- colDef(html = TRUE, align = "center", minWidth = 120)
-    if ("Team" %in% names(df_to_display))     col_defs$Team     <- colDef(align = "center", minWidth = 60)
+    if ("Player"   %in% names(df_to_display)) col_defs$Player   <- colDef(html = TRUE, align = "center", minWidth = 120)
+    if ("Team"     %in% names(df_to_display)) col_defs$Team     <- colDef(align = "center", minWidth = 60)
     if ("Opponent" %in% names(df_to_display)) col_defs$Opponent <- colDef(align = "center", minWidth = 100)
-    if ("Date" %in% names(df_to_display))     col_defs$Date     <- colDef(align = "center", minWidth = 90)
+    if ("Date"     %in% names(df_to_display)) col_defs$Date     <- colDef(align = "center", minWidth = 90)
     if ("HomeAway" %in% names(df_to_display)) col_defs$HomeAway <- colDef(name = "Home/Away", align = "center", minWidth = 110)
     
-    # Right-align any numeric stat columns the user selected
-    right_align <- intersect(names(df_to_display), setdiff(names(df_to_display), c("Player","Team","Opponent","Date","HomeAway")))
-    for (nm in right_align) col_defs[[nm]] <- colDef(align = "right")
+    numeric_cols <- names(df_to_display)[vapply(df_to_display, is.numeric, logical(1))]
+    for (nm in setdiff(numeric_cols, c("Team","Date"))) col_defs[[nm]] <- colDef(align = "right")
     
     reactable(
       df_to_display,
@@ -442,6 +540,17 @@ server <- function(input, output, session) {
   output$metrics_table <- renderReactable({
     m <- metrics() %>%
       dplyr::filter(Suffix == "cal") %>%
+      dplyr::mutate(
+        Target = dplyr::recode(
+          Target,
+          "three_point_field_goals_made" = "3-Point FG",
+          "rebounds" = "Rebounds",
+          "assists"  = "Assists",
+          "steals"   = "Steals",
+          "blocks"   = "Blocks",
+          "points"   = "Points"
+          )
+        ) %>%
       dplyr::select(
         Target, RMSE_Mean, MAE_Mean, R2, RMSE_Median, MAE_Median,
         Pinball_10, Pinball_50, Pinball_90,
@@ -483,7 +592,7 @@ server <- function(input, output, session) {
         STD_Aleatoric_Mean  = colDef(name = "Mean Std (Aleatoric)",         format = colFormat(digits = 2), align = "right"),
         
         Bias_MeanError     = colDef(name = "Bias (Mean Error)",      format = colFormat(digits = 2), align = "right"),
-        Uncert_Error_Corr  = colDef(name = "Uncertainty–Error Corr", format = colFormat(digits = 2), align = "right")
+        Uncert_Error_Corr  = colDef(name = "Uncertainty-Error Corr", format = colFormat(digits = 2), align = "right", minWidth = 110)
       ),
       theme = reactableTheme(
         style    = list(background = "#121212"),

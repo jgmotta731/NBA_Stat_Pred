@@ -13,7 +13,7 @@ library(httr)    # for HEAD/GET + write_disk
 # Remote data endpoints (fixed)
 # ==============================
 PREDICTIONS_URL <- "https://github.com/jgmotta731/NBA_Stat_Pred/raw/refs/heads/main/predictions.parquet"
-METRICS_URL     <- "https://github.com/jgmotta731/NBA_Stat_Pred/raw/refs/heads/main/datasets/Evaluation_Metrics.parquet"
+METRICS_URL     <- "https://github.com/jgmotta731/NBA_Stat_Pred/raw/refs/heads/main/Evaluation_Metrics.parquet"
 
 # Small helper: robust GET → temp file → read_parquet
 .read_remote_parquet <- function(url, timeout_sec = 30L) {

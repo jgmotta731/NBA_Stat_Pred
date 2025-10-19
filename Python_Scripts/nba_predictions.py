@@ -3,7 +3,7 @@
 # Created on Apr 29, 2025
 # Author: Jack Motta
 # ---------------------------------------------------
-import os, warnings, joblib, requests, torch, random, sys
+import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime
 import numpy as np
 import pandas as pd
 from datetime import date
@@ -355,7 +355,7 @@ def main():
     # Step 9: odds scrape for filtering
     # ---------------------------------------------------
     try:
-        API_KEY   = "[insert Odds API Key]"
+        API_KEY   = "[insert Odds API key]"
         SPORT     = "basketball_nba"
         REGION    = "us"
         BOOKMAKER = "draftkings"
@@ -486,8 +486,33 @@ def main():
     today_str   = date.today().strftime("%Y-%m-%d")  # ISO with dashes
     output_path = f"{PREDICTIONS_DIR}/nba_predictions_{today_str}.parquet"
     out.to_parquet(output_path, index=False)  # overwrites if present
+    out.to_parquet('C:/Users/jgmot/OneDrive - Southern Methodist University/Documents/GitHub/NBA_Stat_Pred/predictions.parquet', index=False)
     print(f"Saved {output_path} (rows={len(out)})")
-
-
+    
+    # ---- auto-commit & push to GitHub ----
+    REPO_DIR   = Path(r"C:\Users\jgmot\OneDrive - Southern Methodist University\Documents\GitHub\NBA_Stat_Pred")
+    BRANCH     = "main"  # change if your default is 'master'
+    COMMIT_MSG = f"predictions: {datetime.date.today().isoformat()}"
+    
+    def run(cmd):
+        return subprocess.run(cmd, cwd=REPO_DIR, text=True, capture_output=True)
+    
+    try:
+        status = run(["git", "status", "--porcelain"])
+        if status.stdout.strip():
+            run(["git", "add", "-A"])
+            # commit only if something is staged
+            diff_cached = run(["git", "diff", "--cached", "--quiet"])
+            if diff_cached.returncode != 0:  # 1 = there are staged changes
+                c = run(["git", "commit", "-m", COMMIT_MSG])
+                if c.returncode != 0:
+                    print("Git commit failed:\n", c.stderr)
+            p = run(["git", "push", "origin", BRANCH])
+            if p.returncode != 0:
+                print("Git push failed:\n", p.stderr)
+        else:
+            print("No repo changes; nothing to commit.")
+    except FileNotFoundError:
+        print("Git not found on PATH. Install Git or use full path to git.exe (e.g., r'C:\\Program Files\\Git\\cmd\\git.exe').")
 if __name__ == "__main__":
     main()

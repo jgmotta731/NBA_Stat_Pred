@@ -1,4 +1,5 @@
 # NBA Player Predictions — End-to-End (R + Python)
+Link to Shiny App for final product: https://jmotta31.shinyapps.io/NBA_Prediction_Tool/
 
 Portfolio project that builds a daily NBA player-level prediction dataset and a Shiny app to explore it.  
 Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custom pipeline), modeled with a **Bayesian-style neural network**, and scheduled on Windows via **Task Scheduler**.
@@ -157,8 +158,8 @@ The launchers handle:
 
 ---
 
-## Shiny behavior
-
+## Shiny App
+- Link: https://jmotta31.shinyapps.io/NBA_Prediction_Tool/
 - **Predictions table** is driven by a `reactivePoll` keyed on **path + mtime + size** so the UI refreshes when a new-day parquet lands or the current file is rewritten.  
 - **Metrics** use `reactiveFileReader` and refresh daily.  
 - No redeploy needed; app reads the freshest files from disk.

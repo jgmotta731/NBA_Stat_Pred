@@ -47,16 +47,31 @@ my_theme <- bs_theme(
 ui <- tagList(
   tags$head(
     tags$style(HTML("
-      .navbar { min-height: 64px; padding-top: 3px; padding-bottom: 3px; }
-      .navbar-brand { display: flex; align-items: center; font-size: 1.4rem; }
-      .navbar-brand img { margin-right: 10px; height: 42px; }
-      .navbar-nav > li > a { font-size: 1.0rem !important; font-weight: 500; }
-      .card { display: flex; flex-direction: column; height: 100%; }
-      .card-body { flex: 1; }
-      .reactable .th, .reactable .td { color: #FFFFFF; }
-      .reactable input[type='text'], .reactable select { color: black !important; }
-    "))
+    .navbar { min-height: 64px; padding-top: 3px; padding-bottom: 3px; }
+    .navbar-brand { display: flex; align-items: center; font-size: 1.4rem; }
+    .navbar-brand img { margin-right: 10px; height: 42px; }
+    .navbar-nav > li > a { font-size: 1.0rem !important; font-weight: 500; }
+    .card { display: flex; flex-direction: column; height: 100%; }
+    .card-body { flex: 1; }
+    .reactable .th, .reactable .td { color: #FFFFFF; }
+    .reactable input[type='text'], .reactable select { color: black !important; }
+  ")),
+    # JS: inject CSS to hide/show columns by class (no re-render, pagination stays)
+    tags$script(HTML("
+    Shiny.addCustomMessageHandler('rt-hide-cols-css', function(msg){
+      var styleId = 'hide-cols-' + msg.id;
+      var node = document.getElementById(styleId);
+      if (!node) {
+        node = document.createElement('style');
+        node.id = styleId;
+        document.head.appendChild(node);
+      }
+      node.textContent = msg.css || '';
+    });
+  "))
   ),
+  
+  
   
   navbarPage(
     title = div(tags$img(src = "nba_light.png", alt = "Logo"), "NBA Player Predictor"),
@@ -118,10 +133,10 @@ ui <- tagList(
                 checkboxGroupInput(
                   inputId = "selected_columns",
                   label = NULL,
-                  choices = c("Player", "Team", "Opponent", "Date", "HomeAway",
-                              "3-Point FG", "Rebounds", "Assists", "Steals", "Blocks", "Points"),
-                  selected = c("Player", "Team", "Opponent", "Date", "HomeAway",
-                               "3-Point FG", "Rebounds", "Assists", "Steals", "Blocks", "Points")
+                  choices = c("Player","Team","Opponent","Date","HomeAway",
+                              "Points","Rebounds","Assists","Steals","Blocks","3-Point FG"),
+                  selected = c("Player","Team","Opponent","Date","HomeAway",
+                               "Points","Rebounds","Assists","Steals","Blocks","3-Point FG")
                 )
               )
             )
@@ -233,7 +248,8 @@ ui <- tagList(
 # Server
 # ==============================
 server <- function(input, output, session) {
-  # Implied probability calc
+  
+  # Implied probability calc (unchanged)
   output$implied_prob <- renderText({
     req(input$american_odds)
     odds <- suppressWarnings(as.numeric(input$american_odds))
@@ -248,7 +264,6 @@ server <- function(input, output, session) {
   preds <- reactivePoll(
     600000, session, # 10 min
     checkFunc = function() {
-      # Use HEAD for cheap change detection (ETag/Last-Modified/size)
       r <- try(HEAD(PREDICTIONS_URL, timeout(10)), silent = TRUE)
       if (inherits(r, "try-error") || http_error(r)) return("")
       h <- headers(r)
@@ -258,11 +273,11 @@ server <- function(input, output, session) {
       validate(need(nzchar(PREDICTIONS_URL), "Predictions URL not set"))
       df <- .read_remote_parquet(PREDICTIONS_URL)
       df |>
-        mutate(
-          across(where(is.numeric), ~ round(.x, 1)),
-          home_away = str_to_sentence(home_away)
+        dplyr::mutate(
+          dplyr::across(where(is.numeric), ~ round(.x, 1)),
+          home_away = stringr::str_to_sentence(home_away)
         ) |>
-        arrange(game_date, team_abbreviation, athlete_display_name)
+        dplyr::arrange(game_date, team_abbreviation, athlete_display_name)
     }
   )
   
@@ -286,19 +301,15 @@ server <- function(input, output, session) {
   # --------------------------
   # Predictions table
   # --------------------------
-  output$predictions_table <- renderReactable({
-    req(input$selected_columns)
-    df_raw <- preds()
-    
-    # Ensure columns expected by UI exist (fallbacks if missing)
+  # Build full table (all columns present); used by both render and the column-toggle logic
+  make_table_df <- function(df_raw) {
     if (!"headshot_url" %in% names(df_raw)) df_raw$headshot_url <- ""
-    required_id_cols <- c("athlete_display_name","team_abbreviation","opponent_team_abbreviation",
-                          "game_date","home_away")
+    required_id_cols <- c("athlete_display_name","team_abbreviation",
+                          "opponent_team_abbreviation","game_date","home_away")
     missing_ids <- setdiff(required_id_cols, names(df_raw))
     validate(need(length(missing_ids) == 0,
                   paste("Predictions missing required columns:", paste(missing_ids, collapse=", "))))
-    
-    df <- df_raw %>%
+    df_raw %>%
       mutate(
         Player = paste0(
           "<div style='text-align:center;'>",
@@ -381,38 +392,81 @@ server <- function(input, output, session) {
         `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
         `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
         `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper
-
+      ) %>%
+      select(
+        Player, Team, Opponent, Date, HomeAway,
+        `Points (Mean)`, `Points (Lower)`, `Points (Median)`, `Points (Upper)`,
+        `Points (PI80 Width)`, `Points (Pred Std)`, `Points (Epi Std)`,
+        `Points (Ale Std)`, `Points (Std80 Lower)`, `Points (Std80 Upper)`,
+        `Rebounds (Mean)`, `Rebounds (Lower)`, `Rebounds (Median)`, `Rebounds (Upper)`,
+        `Rebounds (PI80 Width)`, `Rebounds (Pred Std)`, `Rebounds (Epi Std)`,
+        `Rebounds (Ale Std)`, `Rebounds (Std80 Lower)`, `Rebounds (Std80 Upper)`,
+        `Assists (Mean)`, `Assists (Lower)`, `Assists (Median)`, `Assists (Upper)`,
+        `Assists (PI80 Width)`, `Assists (Pred Std)`, `Assists (Epi Std)`,
+        `Assists (Ale Std)`, `Assists (Std80 Lower)`, `Assists (Std80 Upper)`,
+        `Steals (Mean)`, `Steals (Lower)`, `Steals (Median)`, `Steals (Upper)`,
+        `Steals (PI80 Width)`, `Steals (Pred Std)`, `Steals (Epi Std)`,
+        `Steals (Ale Std)`, `Steals (Std80 Lower)`, `Steals (Std80 Upper)`,
+        `Blocks (Mean)`, `Blocks (Lower)`, `Blocks (Median)`, `Blocks (Upper)`,
+        `Blocks (PI80 Width)`, `Blocks (Pred Std)`, `Blocks (Epi Std)`,
+        `Blocks (Ale Std)`, `Blocks (Std80 Lower)`, `Blocks (Std80 Upper)`,
+        `3-Point FG (Mean)`, `3-Point FG (Lower)`, `3-Point FG (Median)`, `3-Point FG (Upper)`,
+        `3-Point FG (PI80 Width)`, `3-Point FG (Pred Std)`, `3-Point FG (Epi Std)`,
+        `3-Point FG (Ale Std)`, `3-Point FG (Std80 Lower)`, `3-Point FG (Std80 Upper)`
       )
-    
-    # Expand group labels to actual columns
+  }
+  
+  # Slugify to build safe CSS classes from column names
+  slug <- function(x) tolower(gsub("[^a-z0-9]+", "-", x))
+  
+  # Build col defs once with per-column classes (cells + headers)
+  build_col_defs <- function(df_all) {
+    defs <- setNames(vector("list", length(names(df_all))), names(df_all))
+    for (nm in names(df_all)) {
+      cls <- paste0("col-", slug(nm))
+      defs[[nm]] <- colDef(
+        html = identical(nm, "Player"),
+        align = if (is.numeric(df_all[[nm]])) "right" else "center",
+        minWidth = if (nm == "Player") 120 else 110,
+        name = if (nm == "HomeAway") "Home/Away" else NULL,
+        class = cls,        # applies to cells
+        headerClass = cls   # applies to header
+      )
+    }
+    defs
+  }
+  
+  # Compute which columns to show from the checkbox labels
+  compute_show_cols <- function(df_all, selected_labels) {
     meta <- c("Player","Team","Opponent","Date","HomeAway")
-    selected_meta  <- intersect(input$selected_columns, meta)
-    selected_stats <- setdiff(input$selected_columns, meta)
-    
+    selected_meta  <- intersect(selected_labels, meta)
+    selected_stats <- setdiff(selected_labels, meta)
     stat_cols <- unlist(lapply(
       selected_stats,
-      function(lbl) grep(paste0("^", gsub("([\\[\\]\\(\\)\\+\\?\\^\\$\\\\\\|\\{\\}])","\\\\\\1", lbl), " \\("),
-                         names(df), value = TRUE)
+      function(lbl) {
+        patt <- paste0("^", gsub("([\\[\\]\\(\\)\\+\\?\\^\\$\\\\\\|\\{\\}])","\\\\\\1", lbl), " \\(")
+        grep(patt, names(df_all), value = TRUE)
+      }
     ), use.names = FALSE)
+    c(selected_meta, stat_cols)
+  }
+  
+  # Build the CSS string to hide unselected columns
+  make_hide_css <- function(all_cols, show_cols) {
+    hide <- setdiff(all_cols, show_cols)
+    if (!length(hide)) return("")
+    sel <- paste(paste0(".", paste0("col-", slug(hide))), collapse = ",")
+    paste0(sel, "{display:none !important;}")
+  }
+  
+  # Render once with ALL columns; hide/show via CSS so pagination stays put
+  output$predictions_table <- renderReactable({
+    df_all   <- make_table_df(preds())
+    col_defs <- build_col_defs(df_all)
     
-    display_cols <- c(selected_meta, stat_cols)
-    req(length(display_cols) > 0)
-    
-    df_to_display <- df[, display_cols, drop = FALSE]
-    
-    # Column defs
-    col_defs <- list()
-    if ("Player"   %in% names(df_to_display)) col_defs$Player   <- colDef(html = TRUE, align = "center", minWidth = 120)
-    if ("Team"     %in% names(df_to_display)) col_defs$Team     <- colDef(align = "center", minWidth = 60)
-    if ("Opponent" %in% names(df_to_display)) col_defs$Opponent <- colDef(align = "center", minWidth = 100)
-    if ("Date"     %in% names(df_to_display)) col_defs$Date     <- colDef(align = "center", minWidth = 90)
-    if ("HomeAway" %in% names(df_to_display)) col_defs$HomeAway <- colDef(name = "Home/Away", align = "center", minWidth = 110)
-    
-    numeric_cols <- names(df_to_display)[vapply(df_to_display, is.numeric, logical(1))]
-    for (nm in setdiff(numeric_cols, c("Team","Date"))) col_defs[[nm]] <- colDef(align = "right")
-    
-    reactable(
-      df_to_display,
+    # initial table render (all columns present)
+    tbl <- reactable(
+      df_all,
       columns = col_defs,
       pagination = TRUE,
       defaultPageSize   = 10,
@@ -429,18 +483,72 @@ server <- function(input, output, session) {
         rowStyle = list(borderBottom = "1px solid #007AC1")
       )
     )
+    
+    # IMPORTANT: do NOT depend on input$selected_columns here.
+    # Just read once to initialize visibility, without creating a dependency.
+    init_labels <- isolate(input$selected_columns)
+    if (is.null(init_labels) || !length(init_labels)) {
+      init_labels <- c("Player","Team","Opponent","Date","HomeAway",
+                       "Points","Rebounds","Assists","Steals","Blocks","3-Point FG")
+    }
+    show_cols <- compute_show_cols(df_all, init_labels)
+    css_text  <- make_hide_css(names(df_all), show_cols)
+    
+    # Apply CSS directly after render (no re-render, no page reset)
+    htmlwidgets::onRender(
+      tbl,
+      sprintf(
+        "function(el,x){
+         var id = 'predictions_table';
+         var css = %s;
+         var styleId = 'hide-cols-' + id;
+         var node = document.getElementById(styleId);
+         if (!node) {
+           node = document.createElement('style');
+           node.id = styleId;
+           document.head.appendChild(node);
+         }
+         node.textContent = css || '';
+       }",
+        jsonlite::toJSON(css_text, auto_unbox = TRUE)
+      )
+    )
+  })
+  
+  # When the user changes the selector: inject new CSS (no re-render)
+  observeEvent(input$selected_columns, ignoreInit = TRUE, {
+    df_all  <- make_table_df(preds())
+    show    <- compute_show_cols(df_all, input$selected_columns)
+    css_txt <- make_hide_css(names(df_all), show)
+    session$sendCustomMessage("rt-hide-cols-css", list(
+      id  = "predictions_table",
+      css = css_txt
+    ))
+  })
+  
+  # When the parquet refreshes: table re-renders; reapply CSS once
+  observeEvent(preds(), ignoreInit = TRUE, {
+    df_all  <- make_table_df(preds())
+    show    <- compute_show_cols(df_all, isolate(input$selected_columns))
+    css_txt <- make_hide_css(names(df_all), show)
+    session$onFlushed(function() {
+      session$sendCustomMessage("rt-hide-cols-css", list(
+        id  = "predictions_table",
+        css = css_txt
+      ))
+    }, once = TRUE)
   })
   
   # --------------------------
-  # Metrics table
+  # Metrics table (unchanged)
   # --------------------------
   output$metrics_table <- renderReactable({
     m_raw <- metrics()
     validate(need(all(c("Target","Suffix") %in% names(m_raw)), "Metrics file missing required columns (Target/Suffix)."))
     
     m <- m_raw %>%
-      filter(Suffix == "cal") %>%
-      mutate(
+      dplyr::filter(Suffix == "cal") %>%
+      dplyr::mutate(
         Target = dplyr::recode(
           Target,
           "three_point_field_goals_made" = "3PM",
@@ -452,7 +560,7 @@ server <- function(input, output, session) {
           .default = Target
         )
       ) %>%
-      select(
+      dplyr::select(
         Target, RMSE_Mean, MAE_Mean, R2, RMSE_Median, MAE_Median,
         Pinball_10, Pinball_50, Pinball_90,
         PI80_Coverage, PI80_Width,

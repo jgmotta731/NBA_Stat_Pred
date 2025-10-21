@@ -63,7 +63,6 @@ def run_feature_engineering(
         low = preferred.lower()
         return low if low in df.columns else None
 
-    cache_has_ids = False
     if cache_read and os.path.exists(save_path):
         fe_cached = pd.read_parquet(save_path)
         all_star_teams = ["DUR", "LEB", "GIA", "WEST", "EAST", "CAN", "CHK", "KEN", "SHQ"]
@@ -229,8 +228,6 @@ def run_feature_engineering(
     fe["fg_pct"]  = _safe_ratio("field_goals_made", "field_goals_attempted")
     fe["fg3_pct"] = _safe_ratio("three_point_field_goals_made", "three_point_field_goals_attempted")
     fe["ft_pct"]  = _safe_ratio("free_throws_made", "free_throws_attempted")
-
-    span = 21
 
     # Rolling/EWM base columns
     rolling_cols = [

@@ -2,7 +2,7 @@
 Link to Shiny App for final product: https://jmotta31.shinyapps.io/NBA_Prediction_Tool/
 
 Portfolio project that builds a daily NBA player-level prediction dataset and a Shiny app to explore it.  
-Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custom pipeline), modeled with a **Bayesian-style neural network**, and scheduled on Windows via **Task Scheduler**.
+Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custom pipeline), modeled with a **Bayesian-style neural network** (MC Dropout, and scheduled on Windows via **Task Scheduler**.
 
 > **Status:** designed to run daily during the NBA season (Oct 21 – Jun 22) and skip the offseason.
 
@@ -11,7 +11,7 @@ Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custo
 ## Highlights
 
 - **Automated data refresh (R):** pulls player box scores, schedule, and builds lineup/on-off features; guarded by a month/day season window.
-- **Feature & model pipeline (Python):** scraping/assembly → feature engineering → clustering → preprocessing → BNN training.
+- **Feature & model pipeline (Python):** scraping/assembly → feature engineering → preprocessing → BNN training.
 - **Daily predictions:** generates `predictions/nba_predictions_YYYY-MM-DD.parquet` for upcoming games; Shiny app hot-reloads.
 - **Launchers for production:** small wrapper scripts handle season windows, logs, and lock files to avoid overlapping runs.
 - **Shiny UI:** dark theme, sortable/filterable tables, and a lightweight implied-probability calculator.
@@ -31,11 +31,10 @@ Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custo
 ├─ Python_Scripts/                   # (or project root, depending on your layout)
 │  ├─ scraping_loading.py            # Scrapes advanced data, merges with hoopR gamelogs + injuries, light FE
 │  ├─ feature_engineering.py         # Main feature engineering block
-│  ├─ clustering.py                  # KMeans clustering; adds cluster label as a feature
 │  ├─ preprocessing.py               # Train/test split, imputers, encoding, pipelines, scalers
 │  ├─ bnn.py                         # Bayesian-like NN (MC dropout for quantiles)
 │  ├─ run_pipeline.py                # Orchestrates training end-to-end
-│  ├─ nba_predictions.py             # Loads artifacts; produces daily predictions parquet (with Odds filter)
+│  ├─ nba_predictions.py             # Loads artifacts; produces daily predictions parquet
 │  └─ launch_nba_predictions.py      # Season guard + logs + lock; calls nba_predictions.py (Task Scheduler)
 │
 ├─ predictions/                      # Daily predictions parquet (nba_predictions_YYYY-MM-DD.parquet)
@@ -59,16 +58,16 @@ Data is gathered and engineered in **R** (hoopR) and **Python** (nba_api + custo
 
 2) **Modeling & predictions (Python)**  
    - `scraping_loading.py` assembles a unified dataframe (nba_api + hoopR + injury flags).  
-   - `feature_engineering.py` derives features; `clustering.py` adds a KMeans cluster label.  
+   - `feature_engineering.py` derives features
    - `preprocessing.py` builds pipelines (imputers/encoders/scalers); `bnn.py` defines a Bayesian-style NN (MC dropout).  
    - `run_pipeline.py` trains the model; artifacts saved under `models/` and `pipelines/`.  
-   - `nba_predictions.py` loads artifacts, scores upcoming games, filters by available props, and saves **`predictions/nba_predictions_YYYY-MM-DD.parquet`**.  
+   - `nba_predictions.py` loads artifacts, scores upcoming games, filters by available props, and saves **`predictions/nba_predictions_YYYY-MM-DD.parquet`** locally and pushes a separate **`nba_predictions.parquet`** to this repo to update the Shiny App's predictions reactable.  
    - `launch_nba_predictions.py` wraps the run for scheduling (season window, logs, lock).
 
 3) **Shiny app**  
    - `app.R` reads:
-     - `predictions/nba_predictions_YYYY-MM-DD.parquet` via **reactivePoll** (detects new day/mtime/size).
-     - `datasets/Evaluation_Metrics.parquet` via **reactiveFileReader**.  
+     - `predictions/nba_predictions.parquet` via GitHub URL.
+     - `datasets/Evaluation_Metrics.parquet` via GitHub URL.  
    - No republish needed day-to-day; the app picks up the latest parquet.
 
 ---
@@ -111,8 +110,6 @@ Generate daily predictions (writes to `predictions/`):
 python Python_Scripts/nba_predictions.py
 ```
 
-> **Note:** any secrets (e.g., Odds API) should be managed outside the repo. Do not commit keys.
-
 ### Shiny app
 
 Run locally:
@@ -154,7 +151,6 @@ The launchers handle:
 
 - The network in `bnn.py` uses **MC dropout** at inference to approximate predictive uncertainty.  
 - Quantile outputs (e.g., 10th/50th/90th) enable **prediction intervals** per target (Points, Assists, Rebounds, 3PTM, Steals, Blocks).  
-- `clustering.py` provides a **player cluster label** (KMeans on PCA-compressed stats) as an additional feature so the model can learn archetypes.
 
 ---
 

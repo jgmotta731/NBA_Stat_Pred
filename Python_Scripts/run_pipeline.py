@@ -6,16 +6,14 @@ Created on Sat Sep 27 2025
 Run end-to-end training:
 1) scrape + load  -> gamelogs (gamelogs_ready_for_fe.parquet)
 2) feature eng    -> gamelogs, feature_groups (gamelogs_features.parquet)
-3) clustering     -> gamelogs (with cluster), feature_groups (gamelogs_ready_for_modeling.parquet)
-4) preprocessing  -> tensors + artifacts
-5) BNN training   -> results_df, artifacts
+3) preprocessing  -> tensors + artifacts
+4) BNN training   -> results_df, artifacts
 """
 
 from __future__ import annotations
 import pandas as pd
 from Python_Scripts.scraping_loading import run_scrape_and_load
 from Python_Scripts.feature_engineering import run_feature_engineering
-from Python_Scripts.clustering import run_clustering
 from Python_Scripts.preprocessing import run_preprocessing
 from Python_Scripts.bnn import run_bnn
 
@@ -28,18 +26,8 @@ def main() -> None:
     # 2) Feature engineering
     gamelogs, feature_groups = run_feature_engineering(gamelogs)
 
-    # 3) PCA + KMeans clustering
-    gamelogs, feature_groups, _ = run_clustering(
-        gamelogs=gamelogs,
-        feature_groups=feature_groups,
-        seed=42,
-        train_season_cutoff=2025,
-        n_components=2,
-        k_final=5,
-        show_diagnostics=False,
-    )
 
-    # 4) Preprocessing
+    # 3) Preprocessing
     (
         X_train_proc,
         X_val_proc,
@@ -56,7 +44,7 @@ def main() -> None:
         season_cutoff=2025,
     )
 
-    # 5) BNN training/eval (saves metrics internally if save_dir is set)
+    # 4) BNN training/eval (saves metrics internally if save_dir is set)
     results_df, _ = run_bnn(
         gamelogs=gamelogs,
         feature_groups=feature_groups,

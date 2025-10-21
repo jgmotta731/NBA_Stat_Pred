@@ -106,47 +106,7 @@ def main():
     targets              = feature_groups["targets"]  # ['three_point_field_goals_made', ..., 'points']
 
     # ---------------------------------------------------
-    # Step 3: player clustering (same preprocessing as training)
-    # ---------------------------------------------------
-    kmeans_final = joblib.load("models/clustering/nba_player_clustering.joblib")
-    pca_pipeline = joblib.load("pipelines/pca_pipeline.joblib")
-
-    # stat columns the PCA expects (robust to missing columns)
-    stat_cols = []
-    targets_with_both = ["field_goals_made"]
-    targets_mean_only = ["field_goals_attempted", "reb_pct", "ast_pct", "usg_pct", "poss", "three_point_field_goals_attempted"]
-    targets_std_only  = ["points", "assists", "rebounds", "steals", "blocks", "three_point_field_goals_made"]
-    for t in targets_with_both + targets_mean_only:
-        cm = f"{t}_expanding_mean"
-        if cm in gamelogs.columns:
-            stat_cols.append(cm)
-    for t in targets_with_both + targets_std_only:
-        cs = f"{t}_expanding_std"
-        if cs in gamelogs.columns:
-            stat_cols.append(cs)
-
-    full_player_summary = (
-        gamelogs.sort_values(["athlete_display_name", "game_date"])
-                .groupby("athlete_display_name")
-                .tail(1)
-                .reset_index(drop=True)
-    )
-    if stat_cols:
-        X_full_cluster = pca_pipeline.transform(full_player_summary[stat_cols])
-        full_player_summary["cluster_label"] = kmeans_final.predict(X_full_cluster) + 1
-        player_clusters = full_player_summary[["athlete_display_name", "cluster_label"]].copy()
-        player_clusters["cluster_label"] = player_clusters["cluster_label"].astype("float32")
-        gamelogs = (
-            gamelogs.drop(columns=["cluster_label"], errors="ignore")
-                    .merge(player_clusters, on="athlete_display_name", how="left")
-        )
-        if "cluster_label" not in categorical_features:
-            categorical_features += ["cluster_label"]
-        if "cluster_label" not in features:
-            features += ["cluster_label"]
-
-    # ---------------------------------------------------
-    # Step 4: upcoming schedule → build prediction rows
+    # Step 3: upcoming schedule → build prediction rows
     # ---------------------------------------------------
     if not os.path.exists(SCHEDULE_PATH):
         raise FileNotFoundError(f"Schedule not found at {SCHEDULE_PATH}")
@@ -268,18 +228,36 @@ def main():
     # 3) Expand to one row per rostered player (now we include traded/rookie players)
     sched = sched.merge(roster, on="team_abbreviation", how="left")
     
-    # 4) Attach priors by PLAYER (not by team)
+    # 4) Attach priors by player
     latest_by_player = (
         gamelogs.sort_values("game_date")
                 .groupby("athlete_display_name", as_index=False)
                 .tail(1)
     )
+    
+    # Normalize player names for merging
+    def _norm_name(s: str) -> str:
+        if pd.isna(s):
+            return ""
+        s = str(s)
+        s = re.sub(r"\(.*?\)", " ", s)                # drop parentheticals like "(DEN)"
+        s = unidecode(s)                               # remove accents: Dončić -> Doncic
+        s = s.replace("’", "'")                        # unify apostrophes
+        s = s.lower()
+        s = re.sub(r"\b(jr|sr|jr\.|sr\.|ii|iii|iv|v)\b", " ", s)  # strip suffixes
+        s = re.sub(r"[^\w\s]", " ", s)                 # remove punctuation (.,-,')
+        s = re.sub(r"\s+", " ", s).strip()             # collapse whitespace
+        return s
+    
+    sched = sched.assign(norm_name=lambda d: d["athlete_display_name"].apply(_norm_name))
+    latest_by_player = latest_by_player.assign(norm_name=lambda d: d["athlete_display_name"].apply(_norm_name))
+    
     sched = sched.merge(
-        latest_by_player.drop(columns=["team_abbreviation"], errors="ignore"),
-        on="athlete_display_name",
-        how="left",
+        latest_by_player.drop(columns=["team_abbreviation","athlete_display_name"], errors="ignore"),
+        on="norm_name", 
+        how="left", 
         suffixes=("", "_latest")
-    )
+    ).drop(columns=["norm_name"], errors="ignore")
     
     # 5) Clean and finalize
     sched = sched.drop(columns=[c for c in sched.columns if c.endswith("_y")], errors="ignore")
@@ -287,7 +265,7 @@ def main():
     sched = sched.dropna(subset=["athlete_display_name"]).reset_index(drop=True)
 
     # ---------------------------------------------------
-    # Step 5: load preprocessing artifacts & build tensors
+    # Step 4: load preprocessing artifacts & build tensors
     # ---------------------------------------------------
     preprocessor    = joblib.load("pipelines/preprocessor_pipeline.joblib")
     prior_pipeline  = joblib.load("pipelines/prior_pipeline.joblib")
@@ -322,7 +300,8 @@ def main():
     )
 
     # ---------------------------------------------------
-    # Step 6: BNN model (same architecture as training) + weights
+    # Step 5: BNN model (same architecture as training) + weights
+    # ---------------------------------------------------
     model = load_bnn_for_inference(
         weights_path="models/bnn/nba_bnn_weights_only.pt",
         input_dim=Xp_num_tensor.shape[1],
@@ -359,7 +338,7 @@ def main():
     q_vec_r = q_vec.reshape(1, -1)
     
     # ---------------------------------------------------
-    # Step 7: MC-dropout predictions (STD-calibrated), then quantile-calibrate, then invert scaling
+    # Step 6: MC-dropout predictions (STD-calibrated), then quantile-calibrate, then invert scaling
     # ---------------------------------------------------
     # ---- MC predictions for future games (STD-calibrated via alea_scale) ----
     mean_pred, std_epi, std_ale, std_pred, q10, q50, q90 = predict_mc(
@@ -368,7 +347,7 @@ def main():
         X_embed=Xp_embed_tensor,
         prior_tensor=Xp_prior_tensor,
         T=50,
-        alea_scale=calib_t,  # <-- STD calibration applied here
+        alea_scale=calib_t,  # STD calibration applied here
     )
     
     # ---- quantile calibration (in standardized space) ----
@@ -409,7 +388,7 @@ def main():
     pred_df["game_id"] = sched.get("game_id", pd.Series(index=sched.index, dtype="object"))
     
     # ---------------------------------------------------
-    # Step 8: assemble output rows
+    # Step 7: assemble output rows
     # ---------------------------------------------------
     # keep sched clean; DO NOT concat pred_df here (avoids duplicate column names)
     sched = sched.reset_index(drop=True)
@@ -461,21 +440,8 @@ def main():
         print("Warning fetching headshots:", e)
 
     # ---------------------------------------------------
-    # Step 9: odds scrape for filtering
+    # Step 8: odds scrape for filtering
     # ---------------------------------------------------
-    def _norm_name(s: str) -> str:
-        if pd.isna(s):
-            return ""
-        s = str(s)
-        s = re.sub(r"\(.*?\)", " ", s)                # drop parentheticals like "(DEN)"
-        s = unidecode(s)                               # remove accents: Dončić -> Doncic
-        s = s.replace("’", "'")                        # unify apostrophes
-        s = s.lower()
-        s = re.sub(r"\b(jr|sr|jr\.|sr\.|ii|iii|iv|v)\b", " ", s)  # strip suffixes
-        s = re.sub(r"[^\w\s]", " ", s)                 # remove punctuation (.,-,')
-        s = re.sub(r"\s+", " ", s).strip()             # collapse whitespace
-        return s
-    
     try:
         API_KEY   = "[Insert Odds API Key]"
         SPORT     = "basketball_nba"
@@ -546,7 +512,7 @@ def main():
         out = df.copy()
 
     # ---------------------------------------------------
-    # Step 10: save parquet
+    # Step 9: save parquet
     # ---------------------------------------------------
     cols_to_keep = [
         "athlete_display_name", "athlete_position_abbreviation",

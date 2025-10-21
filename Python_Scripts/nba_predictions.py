@@ -3,7 +3,7 @@
 # Created on Apr 29, 2025
 # Author: Jack Motta
 # ---------------------------------------------------
-import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime, time
+import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime, time, re
 import numpy as np
 import pandas as pd
 from datetime import date
@@ -16,6 +16,7 @@ from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import commonteamroster
 from pathlib import Path
+from unidecode import unidecode
 
 # ---------------------------------------------------
 # Config
@@ -462,8 +463,21 @@ def main():
     # ---------------------------------------------------
     # Step 9: odds scrape for filtering
     # ---------------------------------------------------
+    def _norm_name(s: str) -> str:
+        if pd.isna(s):
+            return ""
+        s = str(s)
+        s = re.sub(r"\(.*?\)", " ", s)                # drop parentheticals like "(DEN)"
+        s = unidecode(s)                               # remove accents: Dončić -> Doncic
+        s = s.replace("’", "'")                        # unify apostrophes
+        s = s.lower()
+        s = re.sub(r"\b(jr|sr|jr\.|sr\.|ii|iii|iv|v)\b", " ", s)  # strip suffixes
+        s = re.sub(r"[^\w\s]", " ", s)                 # remove punctuation (.,-,')
+        s = re.sub(r"\s+", " ", s).strip()             # collapse whitespace
+        return s
+    
     try:
-        API_KEY   = "[Insert API Key]"
+        API_KEY   = "[Insert Odds API Key]"
         SPORT     = "basketball_nba"
         REGION    = "us"
         BOOKMAKER = "draftkings"
@@ -502,42 +516,33 @@ def main():
             betting_odds_df = pd.DataFrame(all_props)
             od = betting_odds_df.copy()
             od["market_label"] = od["label"] + " " + od["market"].str.replace("player_", "", regex=False).str.title()
-
+    
             pp = od.pivot_table(index="description", columns="market_label", values="price", aggfunc="first")
             pt = od.pivot_table(index="description", columns="market_label", values="point", aggfunc="first")
             pp.columns = [f"{c} - Price" for c in pp.columns]
             pt.columns = [f"{c} - Point" for c in pt.columns]
             pivot = pd.concat([pp, pt], axis=1).reset_index().rename(columns={"description": "player_name"})
-
-            stats = {c.split(" - ")[0].split(" ", 1)[1] for c in pivot.columns if " - " in c}
-            cols = ["player_name"]
-            for stat in sorted(stats):
-                for lbl in ["Over", "Under"]:
-                    for m in ["Price", "Point"]:
-                        cn = f"{lbl} {stat} - {m}"
-                        if cn in pivot.columns:
-                            cols.append(cn)
-            pivot = pivot[cols]
-
-            # normalize names for join
-            pivot["player_name"] = (
-                pivot["player_name"]
-                     .str.replace(r"[^\w\s]", "", regex=True)
-                     .str.replace(r"\b(?:[IVX]+)$", "", regex=True)
-                     .str.strip()
-            )
-            df["norm"] = (
-                df["athlete_display_name"]
-                    .str.replace(r"[^\w\s]", "", regex=True)
-                    .str.replace(r"\b(?:[IVX]+)$", "", regex=True)
-                    .str.strip()
-            )
-
-            out = df.merge(pivot, left_on="norm", right_on="player_name", how="inner").drop(columns=["player_name","norm"])
+    
+            # ---- unified normalization for join (handles accents, punctuation, suffixes) ----
+            pivot["norm_name"] = pivot["player_name"].apply(_norm_name)
+            df["norm_name"]    = df["athlete_display_name"].apply(_norm_name)
+    
+            # keep only useful columns from pivot for merge
+            keep_cols = ["norm_name"] + [c for c in pivot.columns if c.endswith(" - Price") or c.endswith(" - Point")]
+            pivot = pivot[keep_cols]
+    
+            out = df.merge(pivot, on="norm_name", how="inner").drop(columns=["norm_name"])
+            # debug unmatched names
+            if len(out) == 0:
+                print("[ODDS] Warning: join produced 0 rows after normalization.")
+            else:
+                unmatched = set(df["athlete_display_name"]) - set(out["athlete_display_name"])
+                if unmatched:
+                    print(f"[ODDS] Note: {len(unmatched)} players had no matching props after normalization.")
         else:
             out = df.copy()
     except Exception as e:
-        print("Warning fetching odds:", e)
+        print("[ODDS] warning:", e)
         out = df.copy()
 
     # ---------------------------------------------------

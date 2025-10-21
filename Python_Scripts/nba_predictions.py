@@ -3,7 +3,7 @@
 # Created on Apr 29, 2025
 # Author: Jack Motta
 # ---------------------------------------------------
-import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime
+import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime, time
 import numpy as np
 import pandas as pd
 from datetime import date
@@ -13,13 +13,15 @@ from scipy.stats import norm
 from Python_Scripts.scraping_loading import run_scrape_and_load
 from Python_Scripts.feature_engineering import run_feature_engineering
 from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
+from nba_api.stats.static import teams as static_teams
+from nba_api.stats.endpoints import commonteamroster
 from pathlib import Path
 
 # ---------------------------------------------------
 # Config
 # ---------------------------------------------------
 # Project root = one level above Python_Scripts
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path.cwd()
 DATASETS_DIR = str(ROOT / "datasets")
 PREDICTIONS_DIR = str(ROOT / "predictions")
 os.makedirs(DATASETS_DIR, exist_ok=True)
@@ -145,37 +147,143 @@ def main():
     # ---------------------------------------------------
     # Step 4: upcoming schedule → build prediction rows
     # ---------------------------------------------------
+    if not os.path.exists(SCHEDULE_PATH):
+        raise FileNotFoundError(f"Schedule not found at {SCHEDULE_PATH}")
     schedule = pd.read_parquet(SCHEDULE_PATH)
-
-    latest = (
-        gamelogs
-        .sort_values("game_date")
-        .groupby("athlete_display_name", as_index=False)
-        .tail(1)
-    )
-        
-    sched = schedule.loc[
-        (schedule.home_abbreviation != "TBD") &
-        (schedule.away_abbreviation != "TBD")
+    schedule["game_date"] = pd.to_datetime(schedule["game_date"], errors="coerce")
+    
+    _valid_sched = schedule.loc[
+        (schedule["home_abbreviation"] != "TBD") &
+        (schedule["away_abbreviation"] != "TBD")
     ].copy()
-
+    
+    # infer target season from earliest game on the slate
+    first_gd = _valid_sched["game_date"].min()
+    if pd.isna(first_gd):
+        first_gd = pd.Timestamp.today()
+    start_year = int(first_gd.year if first_gd.month >= 10 else first_gd.year - 1)
+    season_str = f"{start_year}-{str(start_year + 1)[-2:]}"
+    
+    ROSTER_CACHE = Path(DATASETS_DIR) / f"roster_{season_str}.parquet"
+    
+    def _fetch_team_roster(tid: int, season: str, retries: int = 4, timeout: int = 30, pause: float = 1.2):
+        """Robust fetch for one team with retries + backoff. Returns DataFrame or None."""
+        wait = pause
+        for attempt in range(1, retries + 1):
+            try:
+                df = commonteamroster.CommonTeamRoster(team_id=tid, season=season, timeout=timeout).get_data_frames()[0]
+                if not df.empty:
+                    return df
+                # if empty, try again
+            except Exception as e:
+                if attempt == retries:
+                    print(f"[ROSTER] failed tid={tid} after {retries} tries: {e}")
+                    return None
+            time.sleep(wait)
+            wait *= 1.8  # exponential backoff
+    
+    # 1) Try to load cached roster
+    if ROSTER_CACHE.exists():
+        roster = pd.read_parquet(ROSTER_CACHE)
+    else:
+        teams_meta = pd.DataFrame(static_teams.get_teams())[['id', 'abbreviation']].rename(
+            columns={'id': 'team_id', 'abbreviation': 'team_abbreviation'}
+        )
+        roster_parts = []
+        failed_tids = []
+    
+        # polite rate limit + retries
+        for _, row in teams_meta.iterrows():
+            tid = int(row['team_id'])
+            df = _fetch_team_roster(tid, season_str, retries=5, timeout=45, pause=1.0)
+            if df is None:
+                failed_tids.append(tid)
+                continue
+            df = df[['PLAYER_ID', 'PLAYER', 'POSITION']].copy()
+            df['team_id'] = tid
+            roster_parts.append(df)
+            time.sleep(0.6)  # small delay between calls to avoid throttling
+    
+        if roster_parts:
+            roster = pd.concat(roster_parts, ignore_index=True)
+            roster = (
+                roster.merge(teams_meta, on='team_id', how='left')
+                      .rename(columns={
+                          'PLAYER': 'athlete_display_name',
+                          'PLAYER_ID': 'player_id',
+                          'POSITION': 'athlete_position_abbreviation'
+                      })
+                      [['team_abbreviation','athlete_display_name','athlete_position_abbreviation','player_id']]
+            )
+        else:
+            roster = pd.DataFrame(columns=['team_abbreviation','athlete_display_name',
+                                           'athlete_position_abbreviation','player_id'])
+    
+        # Fallback fill for teams that failed: use last-known players from your gamelogs
+        if failed_tids:
+            # map team_id -> abbreviation
+            tid2abbr = teams_meta.set_index('team_id')['team_abbreviation'].to_dict()
+            latest_any = (
+                gamelogs.sort_values('game_date')
+                        .groupby(['athlete_display_name'], as_index=False)
+                        .tail(1)
+            )
+            # Bring in last-known team_abbreviation to filter by team for fallback
+            last_by_team = latest_any[['athlete_display_name','athlete_position_abbreviation','team_abbreviation']].copy()
+    
+            fallback_rows = []
+            for tid in failed_tids:
+                abbr = tid2abbr.get(tid)
+                if not abbr:
+                    continue
+                # take up to 18 most recent players for that team (won't be perfect, but prevents empty teams)
+                temp = last_by_team[last_by_team['team_abbreviation'] == abbr].head(18).copy()
+                if temp.empty:
+                    continue
+                temp['player_id'] = np.nan
+                fallback_rows.append(temp[['team_abbreviation','athlete_display_name','athlete_position_abbreviation','player_id']])
+    
+            if fallback_rows:
+                fallback_block = pd.concat(fallback_rows, ignore_index=True)
+                roster = pd.concat([roster, fallback_block], ignore_index=True).drop_duplicates(
+                    ['team_abbreviation','athlete_display_name'], keep='first'
+                )
+    
+        # cache whatever we assembled so we don’t refetch next run
+        roster.to_parquet(ROSTER_CACHE, index=False)
+    
+    # 2) Build the team slate (home/away doubled)
+    sched = _valid_sched.copy()
     sched["home_away"] = "home"
-    away = sched.copy()
-    away["home_away"] = "away"
-    away[["home_abbreviation", "away_abbreviation"]] = away[["away_abbreviation", "home_abbreviation"]]
-
+    _away = sched.copy()
+    _away["home_away"] = "away"
+    _away[["home_abbreviation","away_abbreviation"]] = _away[["away_abbreviation","home_abbreviation"]]
     sched = (
-        pd.concat([sched, away], ignore_index=True)
+        pd.concat([sched, _away], ignore_index=True)
           .rename(columns={"home_abbreviation": "team_abbreviation",
                            "away_abbreviation": "opponent_team_abbreviation"})
-          .merge(latest, on="team_abbreviation", how="left")
-          .dropna(subset=["athlete_display_name"])
     )
-
-    # tidy duped suffixes
-    sched = sched.drop(columns=[c for c in sched.columns if c.endswith("_y")])
+    
+    # 3) Expand to one row per rostered player (now we include traded/rookie players)
+    sched = sched.merge(roster, on="team_abbreviation", how="left")
+    
+    # 4) Attach priors by PLAYER (not by team)
+    latest_by_player = (
+        gamelogs.sort_values("game_date")
+                .groupby("athlete_display_name", as_index=False)
+                .tail(1)
+    )
+    sched = sched.merge(
+        latest_by_player.drop(columns=["team_abbreviation"], errors="ignore"),
+        on="athlete_display_name",
+        how="left",
+        suffixes=("", "_latest")
+    )
+    
+    # 5) Clean and finalize
+    sched = sched.drop(columns=[c for c in sched.columns if c.endswith("_y")], errors="ignore")
     sched.columns = [c[:-2] if c.endswith("_x") else c for c in sched.columns]
-    sched["game_date"] = pd.to_datetime(sched["game_date"], errors="coerce")
+    sched = sched.dropna(subset=["athlete_display_name"]).reset_index(drop=True)
 
     # ---------------------------------------------------
     # Step 5: load preprocessing artifacts & build tensors
@@ -355,7 +463,7 @@ def main():
     # Step 9: odds scrape for filtering
     # ---------------------------------------------------
     try:
-        API_KEY   = "[insert Odds API key]"
+        API_KEY   = "[Insert API Key]"
         SPORT     = "basketball_nba"
         REGION    = "us"
         BOOKMAKER = "draftkings"
@@ -488,6 +596,7 @@ def main():
     out.to_parquet(output_path, index=False)  # overwrites if present
     out.to_parquet('C:/Users/jgmot/OneDrive - Southern Methodist University/Documents/GitHub/NBA_Stat_Pred/predictions.parquet', index=False)
     print(f"Saved {output_path} (rows={len(out)})")
+    print("Saved predictions.parquet to local GitHub Repository folder.")
     
     # ---- auto-commit & push to GitHub ----
     REPO_DIR   = Path(r"C:\Users\jgmot\OneDrive - Southern Methodist University\Documents\GitHub\NBA_Stat_Pred")
@@ -510,9 +619,14 @@ def main():
             p = run(["git", "push", "origin", BRANCH])
             if p.returncode != 0:
                 print("Git push failed:\n", p.stderr)
+            else:
+                # NEW: success message
+                head = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+                print(f"Git push successful → origin/{BRANCH} (HEAD {head})")
         else:
             print("No repo changes; nothing to commit.")
     except FileNotFoundError:
         print("Git not found on PATH. Install Git or use full path to git.exe (e.g., r'C:\\Program Files\\Git\\cmd\\git.exe').")
+
 if __name__ == "__main__":
     main()

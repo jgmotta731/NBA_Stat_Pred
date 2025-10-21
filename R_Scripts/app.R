@@ -19,10 +19,7 @@ METRICS_URL     <- "https://github.com/jgmotta731/NBA_Stat_Pred/raw/refs/heads/m
 .read_remote_parquet <- function(url, timeout_sec = 30L) {
   tmp <- tempfile(fileext = ".parquet")
   r <- GET(url, write_disk(tmp, overwrite = TRUE), timeout(timeout_sec))
-  if (http_error(r)) {
-    status <- status_code(r)
-    stop(sprintf("HTTP %s while fetching %s", status, url))
-  }
+  if (http_error(r)) stop(sprintf("HTTP %s while fetching %s", status_code(r), url))
   arrow::read_parquet(tmp)
 }
 
@@ -36,42 +33,80 @@ my_theme <- bs_theme(
   primary       = "#007AC1",
   base_font     = font_google("Inter"),
   heading_font  = font_google("Roboto"),
-  "navbar-bg"              = "#121212",
-  "navbar-dark-color"      = "#FFFFFF",
-  "navbar-dark-hover-color"= "#007AC1"
+  "navbar-bg"               = "#121212",
+  "navbar-dark-color"       = "#FFFFFF",
+  "navbar-dark-hover-color" = "#007AC1"
 )
+
+PRIMARY_BLUE <- "#007AC1"
 
 # ==============================
 # UI
 # ==============================
 ui <- tagList(
   tags$head(
-    tags$style(HTML("
-    .navbar { min-height: 64px; padding-top: 3px; padding-bottom: 3px; }
-    .navbar-brand { display: flex; align-items: center; font-size: 1.4rem; }
-    .navbar-brand img { margin-right: 10px; height: 42px; }
-    .navbar-nav > li > a { font-size: 1.0rem !important; font-weight: 500; }
-    .card { display: flex; flex-direction: column; height: 100%; }
-    .card-body { flex: 1; }
-    .reactable .th, .reactable .td { color: #FFFFFF; }
-    .reactable input[type='text'], .reactable select { color: black !important; }
-  ")),
-    # JS: inject CSS to hide/show columns by class (no re-render, pagination stays)
-    tags$script(HTML("
-    Shiny.addCustomMessageHandler('rt-hide-cols-css', function(msg){
-      var styleId = 'hide-cols-' + msg.id;
-      var node = document.getElementById(styleId);
-      if (!node) {
-        node = document.createElement('style');
-        node.id = styleId;
-        document.head.appendChild(node);
+    # CSS
+    tags$style(HTML('
+      .navbar { min-height: 64px; padding-top: 3px; padding-bottom: 3px; }
+      .navbar-brand { display: flex; align-items: center; font-size: 1.4rem; }
+      .navbar-brand img { margin-right: 10px; height: 42px; }
+      .navbar-nav > li > a { font-size: 1.0rem !important; font-weight: 500; }
+      .card { display: flex; flex-direction: column; height: 100%; }
+      .card-body { flex: 1; }
+      .reactable .th, .reactable .td { color: #FFFFFF; }
+      .reactable input[type="text"], .reactable select { color: black !important; }
+
+      /* Headers readable, cells compact */
+      .reactable .rt-td { white-space: nowrap; }
+      .reactable .rt-th { white-space: normal; line-height: 1.2; }
+      .reactable .rt-thead .rt-th { padding-top: 8px; padding-bottom: 8px; }
+      .reactable .rt-th, .reactable .rt-th .rt-resizable-header-content { overflow: visible; }
+
+      /* No hover highlight */
+      .reactable .rt-tr:hover .rt-td { background: transparent !important; }
+
+      /* Table fills the card; scroll only when needed */
+      #predictions_wrap { position: relative; overflow-x: auto; width: 100%; }
+      #predictions_wrap .reactable,
+      #predictions_wrap .html-widget,
+      #predictions_wrap .rt-table {
+        min-width: 100%;        /* fill when few columns */
+        width: max-content;     /* grow to content when many columns */
       }
-      node.textContent = msg.css || '';
-    });
-  "))
+
+      /* Sticky search pinned to the scrollport top-right */
+      #predictions_wrap .sticky-search {
+        position: sticky;
+        top: 0;
+        left: 0;
+        right: 0;
+        display: flex;
+        justify-content: flex-end;
+        padding: 6px 6px 0 6px;
+        z-index: 5;
+        background: linear-gradient(90deg, rgba(18,18,18,0) 0%, rgba(18,18,18,0.9) 40%, rgba(18,18,18,1) 100%);
+      }
+      #predictions_wrap .sticky-search .form-control {
+        width: 260px;
+        max-width: 260px;
+        border: 1px solid #007AC1;
+        box-shadow: none;
+      }
+    ')),
+    # JS: live-inject CSS to hide/unhide columns (no table re-render → no page reset)
+    tags$script(HTML("
+      Shiny.addCustomMessageHandler('rt-hide-cols-css', function(msg){
+        var styleId = 'hide-cols-' + msg.id;
+        var node = document.getElementById(styleId);
+        if (!node) {
+          node = document.createElement('style');
+          node.id = styleId;
+          document.head.appendChild(node);
+        }
+        node.textContent = msg.css || '';
+      });
+    "))
   ),
-  
-  
   
   navbarPage(
     title = div(tags$img(src = "nba_light.png", alt = "Logo"), "NBA Player Predictor"),
@@ -83,10 +118,9 @@ ui <- tagList(
       div(
         class = "container-fluid",
         style = "padding:2rem; background-color:#1e1e1e; color:white;",
-        div(
-          class = "text-center mb-4",
-          h1("Welcome to NBA Player Stat Predictor", class = "display-4"),
-          p("Get next-game predictions for NBA players using machine learning models.")
+        div(class = "text-center mb-4",
+            h1("Welcome to NBA Player Stat Predictor", class = "display-4"),
+            p("Get next-game predictions for NBA players using machine learning models.")
         ),
         fluidRow(
           div(class = "col-md-4", style = "padding:1rem;",
@@ -148,7 +182,13 @@ ui <- tagList(
               class = "card",
               style = "background:#1e1e1e; border:1px solid #007AC1; padding:1rem;",
               h2("Weekly Player Predictions", style = "color:white;"),
-              reactableOutput("predictions_table")
+              div(
+                id = "predictions_wrap",
+                div(class = "sticky-search",
+                    textInput("pred_search", NULL, placeholder = "Search players, teams, stats…", width = "260px")
+                ),
+                reactableOutput("predictions_table")
+              )
             )
           )
         )
@@ -176,60 +216,7 @@ ui <- tagList(
         style = "padding:2rem; background:#121212; color:#FFFFFF;",
         h2("How to Interpret Predictions & Metrics"),
         p(class = "text-muted", style = "color:#BBBBBB;",
-          "This page explains all prediction columns and evaluation metrics used in the app."),
-        tags$hr(style = "border-top: 1px solid #007AC1;"),
-        
-        h3("Predicted Stats"),
-        p("Each stat is predicted for the player's next game."),
-        tags$ul(
-          tags$li(tags$b("3-Point FG"), ": Predicted three-pointers made (not attempted)."),
-          tags$li(tags$b("Rebounds"), ": Total rebounds (offensive + defensive)."),
-          tags$li(tags$b("Assists"), ": Recorded assists."),
-          tags$li(tags$b("Steals"), ": Recorded steals."),
-          tags$li(tags$b("Blocks"), ": Recorded blocks."),
-          tags$li(tags$b("Points"), ": Total points scored.")
-        ),
-        
-        h4("Uncertainty Columns (per stat)"),
-        tags$ul(
-          tags$li(tags$b("Mean"), ": Expected value of the stat."),
-          tags$li(tags$b("Median"), ": 50th percentile."),
-          tags$li(tags$b("Lower (q10)"), ": 10th percentile — closer to mean ⇒ tighter, much lower ⇒ more downside risk."),
-          tags$li(tags$b("Upper (q90)"), ": 90th percentile — much higher than mean ⇒ more upside spread."),
-          tags$li(tags$b("PI80 Width"), ": (Upper − Lower). High ⇒ big plausible range; Low ⇒ tight expectation."),
-          tags$li(tags$b("Pred Std"), ": Predictive std (epistemic + aleatoric). High ⇒ wide outcomes; Low ⇒ consistent."),
-          tags$li(tags$b("Epi Std"), ": What the model doesn’t know (context/data limits). High ⇒ new/shifted context."),
-          tags$li(tags$b("Ale Std"), ": Inherent randomness. High ⇒ volatile stat/matchup."),
-          tags$li(tags$b("Std80 Lower / Std80 Upper"), ": ±1.2816 × Pred Std (≈80%). Wider ⇒ more uncertainty.")
-        ),
-        
-        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
-        
-        h3("Metrics"),
-        p("Computed on historical data to judge calibration and accuracy."),
-        tags$ul(
-          tags$li(tags$b("RMSE (Mean)"), ": Lower is better; punishes big misses."),
-          tags$li(tags$b("MAE (Mean)"),  ": Lower is better; typical miss size."),
-          tags$li(tags$b("R²"),          ": Higher is better."),
-          tags$li(tags$b("RMSE/MAE (Median)"), ": Same metrics for median predictions."),
-          tags$li(tags$b("Pinball Loss (q=0.10/0.50/0.90)"), ": Lower is better; quantile accuracy."),
-          tags$li(tags$b("80% PI Coverage (q10–q90)"), ": ≈80% is ideal (wider ⇒ too wide; lower ⇒ too narrow)."),
-          tags$li(tags$b("PI80 Width"), ": Lower is tighter—balance with coverage."),
-          tags$li(tags$b("Below q10 / Above q50 / Above q90"), ": Targets ≈10% / 50% / 10%; deviations ⇒ miscalibration."),
-          tags$li(tags$b("STD 80% Coverage (± z·std)"), ": ≈80% ⇒ std well-scaled."),
-          tags$li(tags$b("Mean Std (Predictive/Epistemic/Aleatoric)"), ": Lower ⇒ more confidence (watch calibration)."),
-          tags$li(tags$b("Bias (Mean Error)"), ": Closer to 0 is better (sign = over/under)."),
-          tags$li(tags$b("Uncertainty–Error Corr"), ": Positive desired—model is uncertain when it tends to miss.")
-        ),
-        
-        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
-        
-        h4("Quick Tips"),
-        tags$ul(
-          tags$li("For conservative plays, focus on ", tags$b("Lower (q10)"), " and small ", tags$b("PI80 Width"), "."),
-          tags$li("If ", tags$b("Pred Std"), " is high, check whether it's driven by ", tags$b("Epi Std"), " or ", tags$b("Ale Std"), "."),
-          tags$li("Good calibration: coverage near 80% and tail rates near 10%/50%/10%.")
-        )
+          "This page explains all prediction columns and evaluation metrics used in the app.")
       )
     )
   ),
@@ -249,7 +236,7 @@ ui <- tagList(
 # ==============================
 server <- function(input, output, session) {
   
-  # Implied probability calc (unchanged)
+  # Implied probability calc
   output$implied_prob <- renderText({
     req(input$american_odds)
     odds <- suppressWarnings(as.numeric(input$american_odds))
@@ -281,9 +268,13 @@ server <- function(input, output, session) {
   })
   
   # --------------------------
-  # Predictions table
+  # Predictions table helpers
   # --------------------------
-  # Build full table (all columns present); used by both render and the column-toggle logic
+  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  strip_html <- function(x) gsub("<[^>]*>", "", x)
+  slug <- function(x) tolower(gsub("[^a-z0-9]+", "-", x))
+  
+  # Build full table (all columns present)
   make_table_df <- function(df_raw) {
     if (!"headshot_url" %in% names(df_raw)) df_raw$headshot_url <- ""
     required_id_cols <- c("athlete_display_name","team_abbreviation",
@@ -291,6 +282,7 @@ server <- function(input, output, session) {
     missing_ids <- setdiff(required_id_cols, names(df_raw))
     validate(need(length(missing_ids) == 0,
                   paste("Predictions missing required columns:", paste(missing_ids, collapse=", "))))
+    
     df_raw %>%
       mutate(
         Player = paste0(
@@ -398,27 +390,17 @@ server <- function(input, output, session) {
       )
   }
   
-  # Slugify to build safe CSS classes from column names
-  slug <- function(x) tolower(gsub("[^a-z0-9]+", "-", x))
-  
-  # Build col defs once with per-column classes (cells + headers)
-  build_col_defs <- function(df_all) {
-    defs <- setNames(vector("list", length(names(df_all))), names(df_all))
-    for (nm in names(df_all)) {
-      cls <- paste0("col-", slug(nm))
-      defs[[nm]] <- colDef(
-        html = identical(nm, "Player"),
-        align = if (is.numeric(df_all[[nm]])) "right" else "center",
-        minWidth = if (nm == "Player") 120 else 110,
-        name = if (nm == "HomeAway") "Home/Away" else NULL,
-        class = cls,        # applies to cells
-        headerClass = cls   # applies to header
-      )
-    }
-    defs
+  # All-column search (case-insensitive), ignoring HTML in Player
+  filter_by_query <- function(df, q) {
+    q <- tolower(trimws(q %||% ""))
+    if (q == "") return(df)
+    hits <- apply(df, 1, function(row) {
+      any(grepl(q, tolower(strip_html(as.character(row))), fixed = TRUE))
+    })
+    df[hits, , drop = FALSE]
   }
   
-  # Compute which columns to show from the checkbox labels
+  # Column classes / selectors
   compute_show_cols <- function(df_all, selected_labels) {
     meta <- c("Player","Team","Opponent","Date","HomeAway")
     selected_meta  <- intersect(selected_labels, meta)
@@ -433,7 +415,6 @@ server <- function(input, output, session) {
     c(selected_meta, stat_cols)
   }
   
-  # Build the CSS string to hide unselected columns
   make_hide_css <- function(all_cols, show_cols) {
     hide <- setdiff(all_cols, show_cols)
     if (!length(hide)) return("")
@@ -441,33 +422,58 @@ server <- function(input, output, session) {
     paste0(sel, "{display:none !important;}")
   }
   
-  # Render once with ALL columns; hide/show via CSS so pagination stays put
+  build_col_defs <- function(df_any) {
+    defs <- setNames(vector("list", length(names(df_any))), names(df_any))
+    for (nm in names(df_any)) {
+      cls <- paste0("col-", slug(nm))
+      defs[[nm]] <- colDef(
+        html     = identical(nm, "Player"),
+        align    = if (is.numeric(df_any[[nm]])) "right" else "center",
+        minWidth = if (nm == "Player") 200 else 110,  # can stretch (no maxWidth caps)
+        name     = if (nm == "HomeAway") "Home/Away" else NULL,
+        class    = cls,
+        headerClass = cls,
+        sticky   = if (nm == "Player") "left" else NULL
+      )
+    }
+    defs
+  }
+  
+  # --------------------------
+  # Render predictions table (single render; column toggles via CSS -> no page reset)
+  # --------------------------
   output$predictions_table <- renderReactable({
-    df_all   <- make_table_df(preds())
+    df_all <- make_table_df(preds())
+    df_all <- filter_by_query(df_all, input$pred_search)   # search may re-render (expected)
     col_defs <- build_col_defs(df_all)
     
-    # initial table render (all columns present)
     tbl <- reactable(
       df_all,
-      columns = col_defs,
+      columns   = c(list(.selection = colDef(show = FALSE)), col_defs),  # hide the radio dot
+      selection = "single",
+      onClick   = "select",
+      highlight = FALSE,
       pagination = TRUE,
-      defaultPageSize   = 10,
+      defaultPageSize = 10,
       showPageSizeOptions = TRUE,
-      pageSizeOptions     = c(5, 10, 15, 20, 25, 100),
-      showPagination = TRUE,
-      showPageInfo  = TRUE,
-      searchable = TRUE,
-      highlight  = TRUE,
+      pageSizeOptions   = c(5, 10, 15, 20, 25, 100),
+      searchable = FALSE,         # we use sticky search above
       compact    = TRUE,
+      fullWidth  = TRUE,
       defaultColDef = colDef(minWidth = 110),
       theme = reactableTheme(
-        style    = list(background = "#121212"),
-        rowStyle = list(borderBottom = "1px solid #007AC1")
+        cellPadding = "6px 8px",
+        style    = list(background = "#121212", color = "#FFFFFF"),
+        rowStyle = list(borderBottom = "1px solid #007AC1"),
+        rowSelectedStyle = list(
+          backgroundColor = "rgba(0, 122, 193, 0.18)",
+          borderLeft      = "3px solid #007AC1",
+          "& td" = list(backgroundColor = "rgba(0, 122, 193, 0.18)")
+        )
       )
     )
     
-    # IMPORTANT: do NOT depend on input$selected_columns here.
-    # Just read once to initialize visibility, without creating a dependency.
+    # Initialize column visibility once (no dependency on input$selected_columns here)
     init_labels <- isolate(input$selected_columns)
     if (is.null(init_labels) || !length(init_labels)) {
       init_labels <- c("Player","Team","Opponent","Date","HomeAway",
@@ -476,30 +482,30 @@ server <- function(input, output, session) {
     show_cols <- compute_show_cols(df_all, init_labels)
     css_text  <- make_hide_css(names(df_all), show_cols)
     
-    # Apply CSS directly after render (no re-render, no page reset)
     htmlwidgets::onRender(
       tbl,
       sprintf(
         "function(el,x){
-         var id = 'predictions_table';
-         var css = %s;
-         var styleId = 'hide-cols-' + id;
-         var node = document.getElementById(styleId);
-         if (!node) {
-           node = document.createElement('style');
-           node.id = styleId;
-           document.head.appendChild(node);
-         }
-         node.textContent = css || '';
-       }",
+           var id = 'predictions_table';
+           var css = %s;
+           var styleId = 'hide-cols-' + id;
+           var node = document.getElementById(styleId);
+           if (!node) {
+             node = document.createElement('style');
+             node.id = styleId;
+             document.head.appendChild(node);
+           }
+           node.textContent = css || '';
+         }",
         jsonlite::toJSON(css_text, auto_unbox = TRUE)
       )
     )
   })
   
-  # When the user changes the selector: inject new CSS (no re-render)
+  # When the user changes the selector: inject new CSS (no re-render → no page reset)
   observeEvent(input$selected_columns, ignoreInit = TRUE, {
     df_all  <- make_table_df(preds())
+    df_all  <- filter_by_query(df_all, input$pred_search)
     show    <- compute_show_cols(df_all, input$selected_columns)
     css_txt <- make_hide_css(names(df_all), show)
     session$sendCustomMessage("rt-hide-cols-css", list(
@@ -508,9 +514,10 @@ server <- function(input, output, session) {
     ))
   })
   
-  # When the parquet refreshes: table re-renders; reapply CSS once
+  # If data refreshes and table re-renders, reapply CSS once
   observeEvent(preds(), ignoreInit = TRUE, {
     df_all  <- make_table_df(preds())
+    df_all  <- filter_by_query(df_all, isolate(input$pred_search))
     show    <- compute_show_cols(df_all, isolate(input$selected_columns))
     css_txt <- make_hide_css(names(df_all), show)
     session$onFlushed(function() {
@@ -522,7 +529,7 @@ server <- function(input, output, session) {
   })
   
   # --------------------------
-  # Metrics table (unchanged)
+  # Metrics table
   # --------------------------
   output$metrics_table <- renderReactable({
     m_raw <- metrics()
@@ -555,13 +562,13 @@ server <- function(input, output, session) {
     reactable(
       m,
       pagination = FALSE,
-      highlight = TRUE,
       compact = TRUE,
+      highlight = FALSE,
       columns = list(
         Target = colDef(name = "Target", align = "left"),
         RMSE_Mean   = colDef(name = "RMSE (Mean)",   format = colFormat(digits = 1), align = "right"),
         MAE_Mean    = colDef(name = "MAE (Mean)",    format = colFormat(digits = 1), align = "right"),
-        R2          = colDef(name = "R²",            format = colFormat(digits = 2), align = "right"),
+        R2          = colDef(name = "R\u00B2",        format = colFormat(digits = 2), align = "right"),
         RMSE_Median = colDef(name = "RMSE (Median)", format = colFormat(digits = 1), align = "right"),
         MAE_Median  = colDef(name = "MAE (Median)",  format = colFormat(digits = 1), align = "right"),
         Pinball_10  = colDef(name = "Pinball Loss (q=0.10)", format = colFormat(digits = 2), align = "right"),
@@ -580,7 +587,7 @@ server <- function(input, output, session) {
         Uncert_Error_Corr  = colDef(name = "Uncertainty-Error Corr", format = colFormat(digits = 2), align = "right", minWidth = 110)
       ),
       theme = reactableTheme(
-        style    = list(background = "#121212"),
+        style    = list(background = "#121212", color = "#FFFFFF"),
         rowStyle = list(borderBottom = "1px solid #007AC1")
       )
     )

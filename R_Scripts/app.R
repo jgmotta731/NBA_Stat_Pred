@@ -261,42 +261,24 @@ server <- function(input, output, session) {
   # --------------------------
   # Predictions via URL
   # --------------------------
-  preds <- reactivePoll(
-    600000, session, # 10 min
-    checkFunc = function() {
-      r <- try(HEAD(PREDICTIONS_URL, timeout(10)), silent = TRUE)
-      if (inherits(r, "try-error") || http_error(r)) return("")
-      h <- headers(r)
-      paste(h[["etag"]], h[["last-modified"]], h[["content-length"]])
-    },
-    valueFunc = function() {
-      validate(need(nzchar(PREDICTIONS_URL), "Predictions URL not set"))
-      df <- .read_remote_parquet(PREDICTIONS_URL)
-      df |>
-        dplyr::mutate(
-          dplyr::across(where(is.numeric), ~ round(.x, 1)),
-          home_away = stringr::str_to_sentence(home_away)
-        ) |>
-        dplyr::arrange(game_date, team_abbreviation, athlete_display_name)
-    }
-  )
+  preds <- reactive({
+    validate(need(nzchar(PREDICTIONS_URL), "Predictions URL not set"))
+    df <- .read_remote_parquet(PREDICTIONS_URL)
+    df |>
+      dplyr::mutate(
+        dplyr::across(where(is.numeric), ~ round(.x, 1)),
+        home_away = stringr::str_to_sentence(home_away)
+      ) |>
+      dplyr::arrange(game_date, team_abbreviation, athlete_display_name)
+  })
   
   # --------------------------
   # Metrics via URL
   # --------------------------
-  metrics <- reactivePoll(
-    86400000, session, # daily
-    checkFunc = function() {
-      r <- try(HEAD(METRICS_URL, timeout(10)), silent = TRUE)
-      if (inherits(r, "try-error") || http_error(r)) return("")
-      h <- headers(r)
-      paste(h[["etag"]], h[["last-modified"]], h[["content-length"]])
-    },
-    valueFunc = function() {
-      validate(need(nzchar(METRICS_URL), "Metrics URL not set"))
-      .read_remote_parquet(METRICS_URL)
-    }
-  )
+  metrics <- reactive({
+    validate(need(nzchar(METRICS_URL), "Metrics URL not set"))
+    .read_remote_parquet(METRICS_URL)
+  })
   
   # --------------------------
   # Predictions table

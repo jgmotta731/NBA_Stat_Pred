@@ -62,10 +62,10 @@ ui <- tagList(
       .reactable .rt-thead .rt-th { padding-top: 8px; padding-bottom: 8px; }
       .reactable .rt-th, .reactable .rt-th .rt-resizable-header-content { overflow: visible; }
 
-      /* No hover highlight */
+      /* No hover highlight (we highlight only on click/selection) */
       .reactable .rt-tr:hover .rt-td { background: transparent !important; }
 
-      /* Table fills the card; scroll only when needed */
+      /* Table fills the card when narrow; scroll only when needed */
       #predictions_wrap { position: relative; overflow-x: auto; width: 100%; }
       #predictions_wrap .reactable,
       #predictions_wrap .html-widget,
@@ -168,9 +168,9 @@ ui <- tagList(
                   inputId = "selected_columns",
                   label = NULL,
                   choices = c("Player","Team","Opponent","Date","HomeAway",
-                              "Points","Rebounds","Assists","Steals","Blocks","3-Point FG"),
+                              "Points","Rebounds","Assists","Steals","Blocks","3PM"),
                   selected = c("Player","Team","Opponent","Date","HomeAway",
-                               "Points","Rebounds","Assists","Steals","Blocks","3-Point FG")
+                               "Points","Rebounds","Assists","Steals","Blocks","3PM")
                 )
               )
             )
@@ -208,7 +208,7 @@ ui <- tagList(
       )
     ),
     
-    # --- GUIDE ---
+    # --- GUIDE (RESTORED) ---
     tabPanel(
       "Guide",
       div(
@@ -216,7 +216,60 @@ ui <- tagList(
         style = "padding:2rem; background:#121212; color:#FFFFFF;",
         h2("How to Interpret Predictions & Metrics"),
         p(class = "text-muted", style = "color:#BBBBBB;",
-          "This page explains all prediction columns and evaluation metrics used in the app.")
+          "This page explains all prediction columns and evaluation metrics used in the app."),
+        tags$hr(style = "border-top: 1px solid #007AC1;"),
+        
+        h3("Predicted Stats"),
+        p("Each stat is predicted for the player's next game."),
+        tags$ul(
+          tags$li(tags$b("3-Point FG"), ": Predicted three-pointers made (not attempted)."),
+          tags$li(tags$b("Rebounds"), ": Total rebounds (offensive + defensive)."),
+          tags$li(tags$b("Assists"), ": Recorded assists."),
+          tags$li(tags$b("Steals"), ": Recorded steals."),
+          tags$li(tags$b("Blocks"), ": Recorded blocks."),
+          tags$li(tags$b("Points"), ": Total points scored.")
+        ),
+        
+        h4("Uncertainty Columns (per stat)"),
+        tags$ul(
+          tags$li(tags$b("Mean"), ": Expected value of the stat."),
+          tags$li(tags$b("Median"), ": 50th percentile."),
+          tags$li(tags$b("Lower (q10)"), ": 10th percentile — closer to mean ⇒ tighter, much lower ⇒ more downside risk."),
+          tags$li(tags$b("Upper (q90)"), ": 90th percentile — much higher than mean ⇒ more upside spread."),
+          tags$li(tags$b("PI80 Width") , ": (Upper − Lower). High ⇒ big plausible range; Low ⇒ tight expectation."),
+          tags$li(tags$b("Pred Std")   , ": Predictive std (epistemic + aleatoric). High ⇒ wide outcomes; Low ⇒ consistent."),
+          tags$li(tags$b("Epi Std")    , ": What the model doesn’t know (context/data limits). High ⇒ new/shifted context."),
+          tags$li(tags$b("Ale Std")    , ": Inherent randomness. High ⇒ volatile stat/matchup."),
+          tags$li(tags$b("Std80 Lower / Std80 Upper"), ": ±1.2816 × Pred Std (≈80%). Wider ⇒ more uncertainty.")
+        ),
+        
+        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
+        
+        h3("Metrics"),
+        p("Computed on historical data to judge calibration and accuracy."),
+        tags$ul(
+          tags$li(tags$b("RMSE (Mean)"), ": Lower is better; punishes big misses."),
+          tags$li(tags$b("MAE (Mean)"),  ": Lower is better; typical miss size."),
+          tags$li(tags$b("R\u00B2"),     ": Higher is better."),
+          tags$li(tags$b("RMSE/MAE (Median)"), ": Same metrics for median predictions."),
+          tags$li(tags$b("Pinball Loss (q=0.10/0.50/0.90)"), ": Lower is better; quantile accuracy."),
+          tags$li(tags$b("80% PI Coverage (q10–q90)"), ": ≈80% is ideal (wider ⇒ too wide; lower ⇒ too narrow)."),
+          tags$li(tags$b("PI80 Width"), ": Lower is tighter—balance with coverage."),
+          tags$li(tags$b("Below q10 / Above q50 / Above q90"), ": Targets ≈10% / 50% / 10%; deviations ⇒ miscalibration."),
+          tags$li(tags$b("STD 80% Coverage (± z·std)"), ": ≈80% ⇒ std well-scaled."),
+          tags$li(tags$b("Mean Std (Predictive/Epistemic/Aleatoric)"), ": Lower ⇒ more confidence (watch calibration)."),
+          tags$li(tags$b("Bias (Mean Error)"), ": Closer to 0 is better (sign = over/under)."),
+          tags$li(tags$b("Uncertainty–Error Corr"), ": Positive desired—model is uncertain when it tends to miss.")
+        ),
+        
+        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
+        
+        h4("Quick Tips"),
+        tags$ul(
+          tags$li("For conservative plays, focus on ", tags$b("Lower (q10)"), " and small ", tags$b("PI80 Width"), "."),
+          tags$li("If ", tags$b("Pred Std"), " is high, check whether it's driven by ", tags$b("Epi Std"), " or ", tags$b("Ale Std"), "."),
+          tags$li("Good calibration: coverage near 80% and tail rates near 10%/50%/10%.")
+        )
       )
     )
   ),
@@ -382,8 +435,9 @@ server <- function(input, output, session) {
         `Steals (PI80 Width)`, `Steals (Pred Std)`, `Steals (Epi Std)`,
         `Steals (Ale Std)`, `Steals (Std80 Lower)`, `Steals (Std80 Upper)`,
         `Blocks (Mean)`, `Blocks (Lower)`, `Blocks (Median)`, `Blocks (Upper)`,
-        `Blocks (PI80 Width)`, `Blocks (Pred Std)`, `Blocks (Epi Std)`,
-        `Blocks (Ale Std)`, `Blocks (Std80 Lower)`, `Blocks (Std80 Upper)`,
+        `Blocks (PI80 Width)`, `Blocks (Pred Std)`,
+        `Blocks (Epi Std)`, `Blocks (Ale Std)`,
+        `Blocks (Std80 Lower)`, `Blocks (Std80 Upper)`,
         `3-Point FG (Mean)`, `3-Point FG (Lower)`, `3-Point FG (Median)`, `3-Point FG (Upper)`,
         `3-Point FG (PI80 Width)`, `3-Point FG (Pred Std)`, `3-Point FG (Epi Std)`,
         `3-Point FG (Ale Std)`, `3-Point FG (Std80 Lower)`, `3-Point FG (Std80 Upper)`
@@ -429,7 +483,7 @@ server <- function(input, output, session) {
       defs[[nm]] <- colDef(
         html     = identical(nm, "Player"),
         align    = if (is.numeric(df_any[[nm]])) "right" else "center",
-        minWidth = if (nm == "Player") 200 else 110,  # can stretch (no maxWidth caps)
+        minWidth = if (nm == "Player") 200 else 110,  # stretchable base
         name     = if (nm == "HomeAway") "Home/Away" else NULL,
         class    = cls,
         headerClass = cls,
@@ -444,7 +498,7 @@ server <- function(input, output, session) {
   # --------------------------
   output$predictions_table <- renderReactable({
     df_all <- make_table_df(preds())
-    df_all <- filter_by_query(df_all, input$pred_search)   # search may re-render (expected)
+    df_all <- filter_by_query(df_all, input$pred_search)   # search can re-render (expected)
     col_defs <- build_col_defs(df_all)
     
     tbl <- reactable(
@@ -457,7 +511,7 @@ server <- function(input, output, session) {
       defaultPageSize = 10,
       showPageSizeOptions = TRUE,
       pageSizeOptions   = c(5, 10, 15, 20, 25, 100),
-      searchable = FALSE,         # we use sticky search above
+      searchable = FALSE,         # using sticky search
       compact    = TRUE,
       fullWidth  = TRUE,
       defaultColDef = colDef(minWidth = 110),

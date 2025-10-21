@@ -310,18 +310,18 @@ server <- function(input, output, session) {
         Date     = game_date,
         HomeAway = home_away,
         
-        # 3-Point FG
-        `3-Point FG (Mean)`        = three_point_field_goals_made_mean,
-        `3-Point FG (Median)`      = three_point_field_goals_made_median,
-        `3-Point FG (Lower)`       = three_point_field_goals_made_lower,
-        `3-Point FG (Upper)`       = three_point_field_goals_made_upper,
-        `3-Point FG (PI80 Width)`  = three_point_field_goals_made_pi80_width,
-        `3-Point FG (Pred Std)`    = three_point_field_goals_made_std_pred,
-        `3-Point FG (Epi Std)`     = three_point_field_goals_made_std_epistemic,
-        `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
-        `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
-        `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper,
-
+        # Points
+        `Points (Mean)`        = points_mean,
+        `Points (Median)`      = points_median,
+        `Points (Lower)`       = points_lower,
+        `Points (Upper)`       = points_upper,
+        `Points (PI80 Width)`  = points_pi80_width,
+        `Points (Pred Std)`    = points_std_pred,
+        `Points (Epi Std)`     = points_std_epistemic,
+        `Points (Ale Std)`     = points_std_aleatoric,
+        `Points (Std80 Lower)` = points_std80_lower,
+        `Points (Std80 Upper)` = points_std80_upper,
+        
         # Rebounds
         `Rebounds (Mean)`        = rebounds_mean,
         `Rebounds (Median)`      = rebounds_median,
@@ -333,7 +333,7 @@ server <- function(input, output, session) {
         `Rebounds (Ale Std)`     = rebounds_std_aleatoric,
         `Rebounds (Std80 Lower)` = rebounds_std80_lower,
         `Rebounds (Std80 Upper)` = rebounds_std80_upper,
-
+        
         # Assists
         `Assists (Mean)`        = assists_mean,
         `Assists (Median)`      = assists_median,
@@ -345,7 +345,7 @@ server <- function(input, output, session) {
         `Assists (Ale Std)`     = assists_std_aleatoric,
         `Assists (Std80 Lower)` = assists_std80_lower,
         `Assists (Std80 Upper)` = assists_std80_upper,
-
+        
         # Steals
         `Steals (Mean)`        = steals_mean,
         `Steals (Median)`      = steals_median,
@@ -357,7 +357,7 @@ server <- function(input, output, session) {
         `Steals (Ale Std)`     = steals_std_aleatoric,
         `Steals (Std80 Lower)` = steals_std80_lower,
         `Steals (Std80 Upper)` = steals_std80_upper,
-
+        
         # Blocks
         `Blocks (Mean)`        = blocks_mean,
         `Blocks (Median)`      = blocks_median,
@@ -369,18 +369,19 @@ server <- function(input, output, session) {
         `Blocks (Ale Std)`     = blocks_std_aleatoric,
         `Blocks (Std80 Lower)` = blocks_std80_lower,
         `Blocks (Std80 Upper)` = blocks_std80_upper,
+        
+        # 3-Point FG
+        `3-Point FG (Mean)`        = three_point_field_goals_made_mean,
+        `3-Point FG (Median)`      = three_point_field_goals_made_median,
+        `3-Point FG (Lower)`       = three_point_field_goals_made_lower,
+        `3-Point FG (Upper)`       = three_point_field_goals_made_upper,
+        `3-Point FG (PI80 Width)`  = three_point_field_goals_made_pi80_width,
+        `3-Point FG (Pred Std)`    = three_point_field_goals_made_std_pred,
+        `3-Point FG (Epi Std)`     = three_point_field_goals_made_std_epistemic,
+        `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
+        `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
+        `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper
 
-        # Points
-        `Points (Mean)`        = points_mean,
-        `Points (Median)`      = points_median,
-        `Points (Lower)`       = points_lower,
-        `Points (Upper)`       = points_upper,
-        `Points (PI80 Width)`  = points_pi80_width,
-        `Points (Pred Std)`    = points_std_pred,
-        `Points (Epi Std)`     = points_std_epistemic,
-        `Points (Ale Std)`     = points_std_aleatoric,
-        `Points (Std80 Lower)` = points_std80_lower,
-        `Points (Std80 Upper)` = points_std80_upper
       )
     
     # Expand group labels to actual columns
@@ -442,7 +443,7 @@ server <- function(input, output, session) {
       mutate(
         Target = dplyr::recode(
           Target,
-          "three_point_field_goals_made" = "3-Point FG",
+          "three_point_field_goals_made" = "3PM",
           "rebounds" = "Rebounds",
           "assists"  = "Assists",
           "steals"   = "Steals",

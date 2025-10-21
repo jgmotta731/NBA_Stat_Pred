@@ -3,7 +3,7 @@
 # Created on Apr 29, 2025
 # Author: Jack Motta
 # ---------------------------------------------------
-import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime, time, re
+import os, warnings, joblib, requests, torch, random, sys, subprocess, datetime, time, re, json
 import numpy as np
 import pandas as pd
 from datetime import date
@@ -16,7 +16,7 @@ from Python_Scripts.bnn import predict_mc, load_bnn_for_inference
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import commonteamroster
 from pathlib import Path
-from unidecode import unidecode
+from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------
 # Config
@@ -98,9 +98,6 @@ def main():
     )
 
     # feature groups from training
-    features             = feature_groups["features"]
-    numeric_features     = feature_groups["numeric_features"]
-    categorical_features = feature_groups["categorical_features"]
     embedding_features   = feature_groups["embedding_features"]
     prior_features       = feature_groups["prior_features"]
     targets              = feature_groups["targets"]  # ['three_point_field_goals_made', ..., 'points']
@@ -442,74 +439,170 @@ def main():
     # ---------------------------------------------------
     # Step 8: odds scrape for filtering
     # ---------------------------------------------------
-    try:
-        API_KEY   = "[Insert Odds API Key]"
-        SPORT     = "basketball_nba"
-        REGION    = "us"
-        BOOKMAKER = "draftkings"
-        MARKETS   = ["player_points","player_assists","player_rebounds","player_steals","player_blocks","player_threes"]
-
-        events_url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
-        params = {"apiKey": API_KEY, "regions": REGION, "markets": "h2h", "oddsFormat": "decimal"}
-        response = requests.get(events_url, params=params, timeout=20)
-        response.raise_for_status()
-        events = response.json()
-
-        all_props = []
-        for event in events:
-            event_id = event["id"]
-            event_url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/events/{event_id}/odds"
-            params = {"apiKey": API_KEY, "regions": REGION, "markets": ",".join(MARKETS),
-                      "oddsFormat": "decimal", "bookmakers": BOOKMAKER}
-            event_response = requests.get(event_url, params=params, timeout=20)
-            if event_response.status_code != 200:
-                print(f"Failed to fetch props for event {event_id}: {event_response.status_code}, {event_response.text}")
+    # ------------------ Parsing ------------------
+    def _extract_names_from_offer_categories(offer_categories) -> set:
+        names = set()
+        for cat in (offer_categories or []):
+            if (cat.get("name") or "").lower() != "player props":
                 continue
-            event_data = event_response.json()
-            for bookmaker in event_data.get("bookmakers", []):
-                for market in bookmaker.get("markets", []):
-                    for outcome in market.get("outcomes", []):
-                        all_props.append({
-                            "event": f"{event_data.get('home_team')} vs {event_data.get('away_team')}",
-                            "market": market.get("key"),
-                            "label": outcome.get("name"),
-                            "description": outcome.get("description"),
-                            "point": outcome.get("point"),
-                            "price": outcome.get("price"),
-                        })
-
-        if all_props:
-            betting_odds_df = pd.DataFrame(all_props)
-            od = betting_odds_df.copy()
-            od["market_label"] = od["label"] + " " + od["market"].str.replace("player_", "", regex=False).str.title()
+            for desc in cat.get("offerSubcategoryDescriptors", []) or []:
+                sub = desc.get("offerSubcategory") or {}
+                for offer_list in sub.get("offers", []) or []:
+                    for offer in offer_list:
+                        for oc in offer.get("outcomes", []) or []:
+                            nm = oc.get("participant") or oc.get("description")
+                            nn = _norm_name(nm)
+                            if nn:
+                                names.add(nn)
+        return names
     
-            pp = od.pivot_table(index="description", columns="market_label", values="price", aggfunc="first")
-            pt = od.pivot_table(index="description", columns="market_label", values="point", aggfunc="first")
-            pp.columns = [f"{c} - Price" for c in pp.columns]
-            pt.columns = [f"{c} - Point" for c in pt.columns]
-            pivot = pd.concat([pp, pt], axis=1).reset_index().rename(columns={"description": "player_name"})
+    # ------------------ Source A: DraftKings via Playwright (robust) ------------------
+    def _get_dk_names_playwright(timeout_s=30, headless=True) -> set:
+        """
+        Open DK NBA 'Player Props' page in a real Chromium context, capture ANY
+        'eventgroups?...format=json' network response, parse, and return names.
+        """
+        league_urls = [
+            "https://sportsbook.draftkings.com/leagues/basketball/nba?category=player-props",
+            "https://sportsbook.draftkings.com/leagues/basketball/nba",  # backup
+        ]
+        names = set()
     
-            # ---- unified normalization for join (handles accents, punctuation, suffixes) ----
-            pivot["norm_name"] = pivot["player_name"].apply(_norm_name)
-            df["norm_name"]    = df["athlete_display_name"].apply(_norm_name)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=headless)
+            ctx = browser.new_context(
+                locale="en-US",
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/128.0.0.0 Safari/537.36"),
+            )
     
-            # keep only useful columns from pivot for merge
-            keep_cols = ["norm_name"] + [c for c in pivot.columns if c.endswith(" - Price") or c.endswith(" - Point")]
-            pivot = pivot[keep_cols]
+            # collect ANY matching responses
+            captured = []
     
-            out = df.merge(pivot, on="norm_name", how="inner").drop(columns=["norm_name"])
-            # debug unmatched names
-            if len(out) == 0:
-                print("[ODDS] Warning: join produced 0 rows after normalization.")
-            else:
-                unmatched = set(df["athlete_display_name"]) - set(out["athlete_display_name"])
-                if unmatched:
-                    print(f"[ODDS] Note: {len(unmatched)} players had no matching props after normalization.")
-        else:
-            out = df.copy()
-    except Exception as e:
-        print("[ODDS] warning:", e)
-        out = df.copy()
+            def on_response(resp):
+                url = resp.url or ""
+                if "eventgroups" in url and "format=json" in url:
+                    try:
+                        data = resp.json()
+                        if data:
+                            captured.append(data)
+                    except Exception:
+                        pass
+    
+            ctx.on("response", on_response)
+            page = ctx.new_page()
+    
+            # try a couple of URLs; wait a bit on each for JS to hydrate & requests to fire
+            for u in league_urls:
+                try:
+                    page.goto(u, wait_until="domcontentloaded", timeout=timeout_s*1000)
+                    # let the SPA hydrate and fire network calls
+                    page.wait_for_timeout(3500)
+                    # sometimes props need scroll to trigger lazy loads
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1500)
+                    if captured:
+                        break
+                except Exception:
+                    continue
+    
+            # If still nothing captured, try to fetch from inside the page (with cookies)
+            if not captured:
+                try:
+                    api_url = "https://sportsbook.draftkings.com/sites/US-SB/api/v5/eventgroups/84240?format=json"
+                    data = page.evaluate("""async (url) => {
+                        try {
+                            const r = await fetch(url, {credentials:'include'});
+                            if (!r.ok) return null;
+                            return await r.json();
+                        } catch(e){ return null; }
+                    }""", api_url)
+                    if data:
+                        captured.append(data)
+                except Exception:
+                    pass
+    
+            browser.close()
+    
+        # parse all captured blobs (if multiple, union names)
+        for data in captured:
+            eg = (data.get("eventGroup") or {})
+            cats = eg.get("offerCategories", [])
+            names |= _extract_names_from_offer_categories(cats)
+    
+        return names
+    
+    # ------------------ Source B: PrizePicks (public JSON) ------------------
+    def _get_prizepicks_names(timeout_s=20) -> set:
+        """
+        Public PrizePicks projections. We only need names present today.
+        """
+        url = "https://api.prizepicks.com/projections?league_id=7"  # NBA historically ID=7
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=timeout_s)
+        r.raise_for_status()
+        data = r.json()
+        incl = {str(i["id"]): i for i in data.get("included", [])}
+        names = set()
+        for proj in data.get("data", []):
+            rel = proj.get("relationships", {}) or {}
+            pl = rel.get("new_player", {}).get("data") or {}
+            pid = str(pl.get("id", ""))
+            nm = incl.get(pid, {}).get("attributes", {}).get("name", "")
+            nn = _norm_name(nm)
+            if nn:
+                names.add(nn)
+        return names
+    
+    # ------------------ Unified, cached, strict fetch ------------------
+    def get_bettable_names_or_die(cache_dir="datasets", use_cache=True, headless=True) -> set:
+        """
+        Returns the union of DK (browser) + PrizePicks names.
+        Caches daily. Raises if both sources fail (filtering is mandatory).
+        """
+        cp = Path(cache_dir) / f"prop_names_{date.today().isoformat()}.json"
+        if use_cache and cp.exists():
+            try:
+                return set(json.load(open(cp, "r")))
+            except Exception:
+                pass
+    
+        names = set()
+        errors = []
+    
+        # Source A: DK via Playwright (most aligned with sportsbook props)
+        try:
+            dk = _get_dk_names_playwright(headless=headless)
+            names |= dk
+        except Exception as e:
+            errors.append(f"DK:{e}")
+    
+        # Source B: PrizePicks fallback
+        try:
+            pp = _get_prizepicks_names()
+            names |= pp
+        except Exception as e:
+            errors.append(f"PP:{e}")
+    
+        if names:
+            try:
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                json.dump(sorted(list(names)), open(cp, "w"))
+            except Exception:
+                pass
+            return names
+    
+        # nothing worked → fail clearly
+        raise RuntimeError("Prop name fetch failed ({}). Filtering required but no source succeeded."
+                           .format("; ".join(errors) or "no details"))
+    
+    bettable_names = get_bettable_names_or_die(cache_dir="datasets", use_cache=True, headless=True)
+    df = df.copy()
+    df["norm_name"] = df["athlete_display_name"].apply(_norm_name)
+    out = df[df["norm_name"].isin(bettable_names)].drop(columns=["norm_name"])
+    if out.empty:
+        raise RuntimeError("Fetched prop names but none matched your players. Check normalization/schedule date.")
 
     # ---------------------------------------------------
     # Step 9: save parquet

@@ -123,9 +123,16 @@ ui <- tagList(
                   selected = c("Player", "Team", "Opponent", "Date", "HomeAway",
                                "3-Point FG", "Rebounds", "Assists", "Steals", "Blocks", "Points")
                 )
+              ),
+              # ---- NEW: Table Options ----
+              # ---- Table Options (simple toggle) ----
+              tags$hr(style = "border-top: 1px solid #007AC1;"),
+              h4("Table Options", style = "color:white;"),
+              checkboxInput(
+                "paginate", "Enable pagination", value = TRUE
+                )
               )
-            )
-          ),
+            ),
           # Main table
           column(
             width = 10,
@@ -321,7 +328,7 @@ server <- function(input, output, session) {
         `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
         `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
         `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper,
-
+        
         # Rebounds
         `Rebounds (Mean)`        = rebounds_mean,
         `Rebounds (Median)`      = rebounds_median,
@@ -333,7 +340,7 @@ server <- function(input, output, session) {
         `Rebounds (Ale Std)`     = rebounds_std_aleatoric,
         `Rebounds (Std80 Lower)` = rebounds_std80_lower,
         `Rebounds (Std80 Upper)` = rebounds_std80_upper,
-
+        
         # Assists
         `Assists (Mean)`        = assists_mean,
         `Assists (Median)`      = assists_median,
@@ -345,7 +352,7 @@ server <- function(input, output, session) {
         `Assists (Ale Std)`     = assists_std_aleatoric,
         `Assists (Std80 Lower)` = assists_std80_lower,
         `Assists (Std80 Upper)` = assists_std80_upper,
-
+        
         # Steals
         `Steals (Mean)`        = steals_mean,
         `Steals (Median)`      = steals_median,
@@ -357,7 +364,7 @@ server <- function(input, output, session) {
         `Steals (Ale Std)`     = steals_std_aleatoric,
         `Steals (Std80 Lower)` = steals_std80_lower,
         `Steals (Std80 Upper)` = steals_std80_upper,
-
+        
         # Blocks
         `Blocks (Mean)`        = blocks_mean,
         `Blocks (Median)`      = blocks_median,
@@ -369,7 +376,7 @@ server <- function(input, output, session) {
         `Blocks (Ale Std)`     = blocks_std_aleatoric,
         `Blocks (Std80 Lower)` = blocks_std80_lower,
         `Blocks (Std80 Upper)` = blocks_std80_upper,
-
+        
         # Points
         `Points (Mean)`        = points_mean,
         `Points (Median)`      = points_median,
@@ -410,10 +417,22 @@ server <- function(input, output, session) {
     numeric_cols <- names(df_to_display)[vapply(df_to_display, is.numeric, logical(1))]
     for (nm in setdiff(numeric_cols, c("Team","Date"))) col_defs[[nm]] <- colDef(align = "right")
     
+    # ---- Pagination from sidebar toggle only ----
+    pg_enable <- isTRUE(input$paginate)
+    
     reactable(
       df_to_display,
       columns = col_defs,
-      pagination = TRUE,
+      pagination = pg_enable,
+      # default page size for initial render when pagination is on
+      defaultPageSize = 10,
+      # let the in-table selector control rows/page when pagination is on
+      showPageSizeOptions = pg_enable,
+      pageSizeOptions     = c(5, 10, 15, 20, 25),
+      # hide controls when pagination is off
+      showPagination = pg_enable,
+      showPageInfo  = pg_enable,
+      
       searchable = TRUE,
       highlight  = TRUE,
       compact    = TRUE,
@@ -424,6 +443,7 @@ server <- function(input, output, session) {
       )
     )
   })
+  
   
   # --------------------------
   # Metrics table

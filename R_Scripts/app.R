@@ -181,11 +181,11 @@ ui <- tagList(
           tags$li(tags$b("Median"), ": 50th percentile."),
           tags$li(tags$b("Lower (q10)"), ": 10th percentile — closer to mean ⇒ tighter, much lower ⇒ more downside risk."),
           tags$li(tags$b("Upper (q90)"), ": 90th percentile — much higher than mean ⇒ more upside spread."),
+          tags$li(tags$b("PI80 Width"), ": (Upper − Lower). High ⇒ big plausible range; Low ⇒ tight expectation."),
           tags$li(tags$b("Pred Std"), ": Predictive std (epistemic + aleatoric). High ⇒ wide outcomes; Low ⇒ consistent."),
           tags$li(tags$b("Epi Std"), ": What the model doesn’t know (context/data limits). High ⇒ new/shifted context."),
           tags$li(tags$b("Ale Std"), ": Inherent randomness. High ⇒ volatile stat/matchup."),
-          tags$li(tags$b("Std80 Lower / Std80 Upper"), ": ±1.2816 × Pred Std (≈80%). Wider ⇒ more uncertainty."),
-          tags$li(tags$b("PI80 Width"), ": (Upper − Lower). High ⇒ big plausible range; Low ⇒ tight expectation.")
+          tags$li(tags$b("Std80 Lower / Std80 Upper"), ": ±1.2816 × Pred Std (≈80%). Wider ⇒ more uncertainty.")
         ),
         
         tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
@@ -315,72 +315,72 @@ server <- function(input, output, session) {
         `3-Point FG (Median)`      = three_point_field_goals_made_median,
         `3-Point FG (Lower)`       = three_point_field_goals_made_lower,
         `3-Point FG (Upper)`       = three_point_field_goals_made_upper,
+        `3-Point FG (PI80 Width)`  = three_point_field_goals_made_pi80_width,
         `3-Point FG (Pred Std)`    = three_point_field_goals_made_std_pred,
         `3-Point FG (Epi Std)`     = three_point_field_goals_made_std_epistemic,
         `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
         `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
         `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper,
-        `3-Point FG (PI80 Width)`  = three_point_field_goals_made_pi80_width,
-        
+
         # Rebounds
         `Rebounds (Mean)`        = rebounds_mean,
         `Rebounds (Median)`      = rebounds_median,
         `Rebounds (Lower)`       = rebounds_lower,
         `Rebounds (Upper)`       = rebounds_upper,
+        `Rebounds (PI80 Width)`  = rebounds_pi80_width,
         `Rebounds (Pred Std)`    = rebounds_std_pred,
         `Rebounds (Epi Std)`     = rebounds_std_epistemic,
         `Rebounds (Ale Std)`     = rebounds_std_aleatoric,
         `Rebounds (Std80 Lower)` = rebounds_std80_lower,
         `Rebounds (Std80 Upper)` = rebounds_std80_upper,
-        `Rebounds (PI80 Width)`  = rebounds_pi80_width,
-        
+
         # Assists
         `Assists (Mean)`        = assists_mean,
         `Assists (Median)`      = assists_median,
         `Assists (Lower)`       = assists_lower,
         `Assists (Upper)`       = assists_upper,
+        `Assists (PI80 Width)`  = assists_pi80_width,
         `Assists (Pred Std)`    = assists_std_pred,
         `Assists (Epi Std)`     = assists_std_epistemic,
         `Assists (Ale Std)`     = assists_std_aleatoric,
         `Assists (Std80 Lower)` = assists_std80_lower,
         `Assists (Std80 Upper)` = assists_std80_upper,
-        `Assists (PI80 Width)`  = assists_pi80_width,
-        
+
         # Steals
         `Steals (Mean)`        = steals_mean,
         `Steals (Median)`      = steals_median,
         `Steals (Lower)`       = steals_lower,
         `Steals (Upper)`       = steals_upper,
+        `Steals (PI80 Width)`  = steals_pi80_width,
         `Steals (Pred Std)`    = steals_std_pred,
         `Steals (Epi Std)`     = steals_std_epistemic,
         `Steals (Ale Std)`     = steals_std_aleatoric,
         `Steals (Std80 Lower)` = steals_std80_lower,
         `Steals (Std80 Upper)` = steals_std80_upper,
-        `Steals (PI80 Width)`  = steals_pi80_width,
-        
+
         # Blocks
         `Blocks (Mean)`        = blocks_mean,
         `Blocks (Median)`      = blocks_median,
         `Blocks (Lower)`       = blocks_lower,
         `Blocks (Upper)`       = blocks_upper,
+        `Blocks (PI80 Width)`  = blocks_pi80_width,
         `Blocks (Pred Std)`    = blocks_std_pred,
         `Blocks (Epi Std)`     = blocks_std_epistemic,
         `Blocks (Ale Std)`     = blocks_std_aleatoric,
         `Blocks (Std80 Lower)` = blocks_std80_lower,
         `Blocks (Std80 Upper)` = blocks_std80_upper,
-        `Blocks (PI80 Width)`  = blocks_pi80_width,
-        
+
         # Points
         `Points (Mean)`        = points_mean,
         `Points (Median)`      = points_median,
         `Points (Lower)`       = points_lower,
         `Points (Upper)`       = points_upper,
+        `Points (PI80 Width)`  = points_pi80_width,
         `Points (Pred Std)`    = points_std_pred,
         `Points (Epi Std)`     = points_std_epistemic,
         `Points (Ale Std)`     = points_std_aleatoric,
         `Points (Std80 Lower)` = points_std80_lower,
-        `Points (Std80 Upper)` = points_std80_upper,
-        `Points (PI80 Width)`  = points_pi80_width
+        `Points (Std80 Upper)` = points_std80_upper
       )
     
     # Expand group labels to actual columns

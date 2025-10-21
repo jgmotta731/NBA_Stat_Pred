@@ -654,6 +654,37 @@ def main():
     # only keep required columns
     out = out[cols_to_keep].copy()
     
+    # --- Clamp nonnegative stat summaries for DISPLAY-ONLY parquet ---
+    # Don't touch std/variance columns except for *_std80_lower (a "bound-like" column)
+    nonneg_prefixes = [
+        "three_point_field_goals_made",  # 3PM
+        "rebounds", "assists", "steals", "blocks", "points",
+    ]
+    summary_suffixes = ["mean", "median", "lower", "upper"]
+    
+    # 1) Clamp summary stats to [0, inf)
+    for p in nonneg_prefixes:
+        for s in summary_suffixes:
+            col = f"{p}_{s}"
+            if col in out.columns:
+                out[col] = out[col].clip(lower=0.0)
+    
+    # 2) Clamp the std-derived lower bound used for an ~80% interval
+    for p in nonneg_prefixes:
+        low = f"{p}_std80_lower"
+        if low in out.columns:
+            out[low] = out[low].clip(lower=0.0)
+    
+    # 3) Recompute PI80 width from the (now clamped) bounds so the table is consistent
+    for p in nonneg_prefixes:
+        lo, hi, width = f"{p}_lower", f"{p}_upper", f"{p}_pi80_width"
+        if lo in out.columns and hi in out.columns and width in out.columns:
+            lo_c = out[lo].clip(lower=0.0)
+            hi_c = out[hi].clip(lower=0.0)
+            out[lo] = lo_c
+            out[hi] = hi_c
+            out[width] = (hi_c - lo_c).clip(lower=0.0)
+        
     os.makedirs(PREDICTIONS_DIR, exist_ok=True)  # no-op if it already exists
     today_str   = date.today().strftime("%Y-%m-%d")  # ISO with dashes
     output_path = f"{PREDICTIONS_DIR}/nba_predictions_{today_str}.parquet"

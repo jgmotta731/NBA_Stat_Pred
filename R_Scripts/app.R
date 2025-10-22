@@ -237,7 +237,120 @@ ui <- tagList(
         style = "padding:2rem; background:#121212; color:#FFFFFF;",
         h2("How to Interpret Predictions & Metrics"),
         p(class = "text-muted", style = "color:#BBBBBB;",
-          "This page explains all prediction columns and evaluation metrics used in the app.")
+          "This page explains all prediction columns and evaluation metrics used in the app."
+        ),
+        tags$hr(style = "border-top: 1px solid #007AC1;"),
+        
+        h3("Predicted Stats"),
+        p("Each stat is predicted for the player's next game."),
+        tags$ul(
+          tags$li(tags$b("3PM")),
+          tags$li(tags$b("Rebounds")),
+          tags$li(tags$b("Assists")),
+          tags$li(tags$b("Steals")),
+          tags$li(tags$b("Blocks")),
+          tags$li(tags$b("Points"))
+        ),
+        
+        h4("Uncertainty Columns (per stat)"),
+        tags$ul(
+          tags$li(tags$b("Mean"), ": Expected value of the stat — the model’s best overall estimate."),
+          tags$li(tags$b("Median"), ": 50th percentile — midpoint prediction where half of outcomes are above and half below."),
+          tags$li(tags$b("Lower (q10)"), ": 10th percentile — closer to mean ⇒ tighter, much lower ⇒ more downside risk."),
+          tags$li(tags$b("Upper (q90)"), ": 90th percentile — much higher than mean ⇒ more upside spread."),
+          tags$li(tags$b("PI80 Width"), ": 80% predictive interval width — distance between 10th and 90th percentiles. High ⇒ more uncertainty; Low ⇒ tighter expectation."),
+          tags$li(tags$b("Pred Std"), ": Predicted standard deviation — spread and total uncertainty. High ⇒ wide outcomes; Low ⇒ tight range."),
+          tags$li(tags$b("Epi Std"), ": Epistemic uncertainty — what the model doesn’t know (context/data limits). High ⇒ new context; Low ⇒ unfamiliar situation."),
+          tags$li(tags$b("Ale Std"), ": Aleatoric uncertainty — inherent randomness (shooting variance, pace, foul trouble). High ⇒ volatile; Low ⇒ consistent."),
+          tags$li(tags$b("Std80 Lower / Std80 Upper"), ": Mean ± 1.28 × Pred Std — 80% interval based on the predicted standard deviation. Wider ⇒ more uncertainty; narrower ⇒ tighter outcomes"),
+        ),
+        
+        h5("Examples of low vs. high values (by stat)"),
+        p("Use these as ballpark cutoffs; compare players in similar roles."),
+        tags$ul(
+          tags$li(
+            tags$b("Points"),
+            tags$ul(
+              tags$li("Pred Std: low ≤ 3 pts, high ≥ 6 pts"),
+              tags$li("Epi Std: low ≤ 2 pts, high ≥ 4 pts"),
+              tags$li("Ale Std: low ≤ 2 pts, high ≥ 4 pts"),
+              tags$li("Std80 width (Std80 Upper − Std80 Lower): narrow ≤ 6 pts, wide ≥ 12 pts")
+            )
+          ),
+          tags$li(
+            tags$b("Rebounds"),
+            tags$ul(
+              tags$li("Pred Std: low ≤ 2, high ≥ 4"),
+              tags$li("Epi Std: low ≤ 1, high ≥ 2"),
+              tags$li("Ale Std: low ≤ 1.5, high ≥ 3"),
+              tags$li("Std80 width: narrow ≤ 3, wide ≥ 6")
+            )
+          ),
+          tags$li(
+            tags$b("Assists"),
+            tags$ul(
+              tags$li("Pred Std: low ≤ 1.5, high ≥ 3"),
+              tags$li("Epi Std: low ≤ 0.8, high ≥ 1.5"),
+              tags$li("Ale Std: low ≤ 1.0, high ≥ 2.0"),
+              tags$li("Std80 width: narrow ≤ 2.5, wide ≥ 5")
+            )
+          ),
+          tags$li(
+            tags$b("3PM"),
+            tags$ul(
+              tags$li("Pred Std: low ≤ 0.5, high ≥ 1.0"),
+              tags$li("Epi Std: low ≤ 0.3, high ≥ 0.6"),
+              tags$li("Ale Std: low ≤ 0.4, high ≥ 0.8"),
+              tags$li("Std80 width: narrow ≤ 1.0, wide ≥ 2.0")
+            )
+          ),
+          tags$li(
+            tags$b("Steals"),
+            tags$ul(
+              tags$li("Pred Std: low ≤ 0.4, high ≥ 0.8"),
+              tags$li("Epi Std: low ≤ 0.2, high ≥ 0.4"),
+              tags$li("Ale Std: low ≤ 0.3, high ≥ 0.6"),
+              tags$li("Std80 width: narrow ≤ 0.8, wide ≥ 1.6")
+            )
+          ),
+          tags$li(
+            tags$b("Blocks"),
+            tags$ul(
+              tags$li("Pred Std: low ≤ 0.4, high ≥ 0.8"),
+              tags$li("Epi Std: low ≤ 0.2, high ≥ 0.4"),
+              tags$li("Ale Std: low ≤ 0.3, high ≥ 0.6"),
+              tags$li("Std80 width: narrow ≤ 0.8, wide ≥ 1.6")
+            )
+          )
+        ),
+        
+        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
+        
+        h3("Metrics"),
+        p("Computed on historical data to judge accuracy and calibration."),
+        tags$ul(
+          tags$li(tags$b("RMSE (Mean)"), ": Lower is better; penalizes big misses."),
+          tags$li(tags$b("MAE (Mean)"),  ": Lower is better; typical miss size."),
+          tags$li(tags$b("R²"),          ": Higher is better."),
+          tags$li(tags$b("RMSE/MAE (Median)"), ": Same metrics for median predictions."),
+          tags$li(tags$b("Pinball Loss (q=0.10/0.50/0.90)"), ": Lower is better; quantile errors."),
+          tags$li(tags$b("80% PI Coverage (q10–q90)"), ": ≈80% is on target (higher ⇒ too wide; lower ⇒ too narrow)."),
+          tags$li(tags$b("PI80 Width"), ": Balance against coverage—narrow is good if coverage stays near 80%."),
+          tags$li(tags$b("Below q10 / Above q50 / Above q90"), ": Aiming ≈10% / 50% / 10%; large deviations indicate miscalibration."),
+          tags$li(tags$b("STD 80% Coverage (± z·std)"), ": ≈80% suggests the spread is well-scaled."),
+          tags$li(tags$b("Mean Std (Predictive/Epistemic/Aleatoric)"), ": Lower generally indicates tighter, more confident predictions (watch coverage)."),
+          tags$li(tags$b("Bias (Mean Error)"), ": Closer to 0 is better (sign shows over/under)."),
+          tags$li(tags$b("Uncertainty–Error Corr"), ": Positive is preferred—larger errors happen when uncertainty is higher.")
+        ),
+        
+        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
+        
+        h4("Quick Tips"),
+        tags$ul(
+          tags$li(HTML(paste0("For conservative plays, focus on ", tags$b("Lower (q10)"), " and small ", tags$b("PI80 Width"), "."))),
+          tags$li(HTML(paste0("If ", tags$b("Pred Std"), " is high, check whether it's driven by ", tags$b("Epi Std"), " or ", tags$b("Ale Std"), "."))),
+          tags$li("Good calibration is where about 80% of actual results fall within the 80% interval, and outcomes fall below q10, above q50, and above q90 roughly 10%/50%/10% of the time."),
+        )
       )
     )
   ),

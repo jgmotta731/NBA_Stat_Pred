@@ -41,8 +41,9 @@ PREPROCESSED_PATH = READY_FOR_FE_PATH
 GAMELOGS_PATH = f"{DATASETS_DIR}/nba_gamelogs.parquet"
 LINEUPS_PATH = f"{DATASETS_DIR}/lineup_stints.parquet"
 ONOFF_PATH = f"{DATASETS_DIR}/onoff_player_game.parquet"
-INJURY_A = "Injury Database.csv"
-INJURY_B = "2025_injuries.csv"
+INJURY_A = f"{DATASETS_DIR}/Injury Database.csv"
+INJURY_B = f"{DATASETS_DIR}/2025_injuries.csv"
+INJURY_C = f"{DATASETS_DIR}/current_injuries.parquet"
 
 CHUNK_SIZE = 120
 CHUNK_SLEEP = 420.0  # 7 minutes
@@ -112,6 +113,7 @@ class ScrapeLoadPipeline:
         onoff_path: str = ONOFF_PATH,
         injury_a: str = INJURY_A,
         injury_b: str = INJURY_B,
+        injury_c: str = INJURY_C,
         chunk_size: int = CHUNK_SIZE,
         chunk_sleep: float = CHUNK_SLEEP,
         per_request_sleep: Tuple[float, float] = PER_REQUEST_SLEEP,
@@ -130,6 +132,7 @@ class ScrapeLoadPipeline:
         self.onoff_path = onoff_path
         self.injury_a = injury_a
         self.injury_b = injury_b
+        self.injury_c = injury_c
 
         self.chunk_size = chunk_size
         self.chunk_sleep = chunk_sleep
@@ -253,6 +256,84 @@ class ScrapeLoadPipeline:
         merged_df.to_parquet(self.merged_adv_parquet, index=False)
         print(f"Merged data saved to {self.merged_adv_parquet}")
         return combined_df, merged_df
+    
+    # ---------- Injury helpers (A/B/C unified) ----------
+    @staticmethod
+    def _prep_injury_ab(df: pd.DataFrame) -> pd.DataFrame:
+        """A & B share shape: PLAYER, TEAM, DATE, STATUS?, REASON?"""
+        out = df.copy()
+        out["norm"] = out["PLAYER"].astype(str).apply(normalize_name)
+        out["DATE"] = pd.to_datetime(out["DATE"], errors="coerce")
+        keep = ["TEAM", "DATE", "PLAYER", "norm"]
+        for c in ("STATUS", "REASON"):
+            if c in out.columns:
+                keep.append(c)
+        out = out[keep].dropna(subset=["norm", "DATE"]).drop_duplicates()
+        return out
+    
+    @staticmethod
+    def _parse_injury_c_date(x) -> pd.Timestamp | None:
+        """INJURY_C.updated like 'Tue, Sep 23, 2025' -> pandas Timestamp date."""
+        if pd.isna(x):
+            return None
+        s = str(x).strip()
+        for fmt in ("%a, %b %d, %Y", "%A, %b %d, %Y", "%b %d, %Y"):
+            try:
+                return pd.to_datetime(pd.to_datetime(s, format=fmt)).normalize()
+            except Exception:
+                pass
+        try:
+            return pd.to_datetime(s, errors="coerce").normalize()
+        except Exception:
+            return None
+    
+    @staticmethod
+    def _prep_injury_c(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        C columns: player, team, updated, description, source
+        We emit: TEAM, DATE, PLAYER, norm, STATUS, REASON
+        """
+        out = df.rename(columns={
+            "player": "PLAYER",
+            "team": "TEAM",
+            "updated": "UPDATED",
+            "description": "DESCRIPTION",
+        }).copy()
+    
+        # DATE from UPDATED
+        out["DATE"] = out["UPDATED"].apply(ScrapeLoadPipeline._parse_injury_c_date)
+    
+        # STATUS/REASON from DESCRIPTION like "Out (Achilles) - ..."
+        def _status_reason(s: str) -> tuple[str | None, str | None]:
+            if pd.isna(s) or not str(s).strip():
+                return (None, None)
+            txt = str(s).strip()
+            m = re.match(r"^\s*([A-Za-z][A-Za-z\- ]+?)\s*(?:\(([^)]+)\))?", txt)
+            status = m.group(1).strip().title() if m else None
+            reason = m.group(2).strip() if (m and m.group(2)) else None
+            # normalize canonical statuses a bit
+            canon = {
+                "Out","Doubtful","Questionable","Probable","Available",
+                "Inactive","Day-To-Day","Two-Way","Ineligible",
+                "Return To Competition Reconditioning"
+            }
+            if status:
+                for w in canon:
+                    if status.lower().startswith(w.lower()):
+                        status = w
+                        break
+            return (status, reason)
+    
+        sr = out["DESCRIPTION"].apply(_status_reason)
+        out["STATUS"] = [t[0] for t in sr]
+        out["REASON"] = [t[1] for t in sr]
+    
+        # Player norm
+        out["norm"] = out["PLAYER"].astype(str).apply(normalize_name)
+    
+        keep = ["TEAM", "DATE", "PLAYER", "norm", "STATUS", "REASON"]
+        out = out[keep].dropna(subset=["norm", "DATE"]).drop_duplicates()
+        return out
 
     # ---------- Stage 3: load R data, injuries, on/off, lineups; build ready-for-FE ----------
     def build_ready_for_fe(self) -> pd.DataFrame:
@@ -268,14 +349,24 @@ class ScrapeLoadPipeline:
         combined_df_merged = combined_df_merged.dropna().reset_index(drop=True)
 
         # Inputs (from R + others)
-        injury_db = pd.concat([
-            pd.read_csv(self.injury_a),
-            pd.read_csv(self.injury_b)
-        ], ignore_index=True)
+        A = pd.read_csv(self.injury_a)
+        B = pd.read_csv(self.injury_b)
+        inj_frames = [self._prep_injury_ab(A), self._prep_injury_ab(B)]
+
+        # Optional current injuries from Basketball-Reference (parquet)
+        if self.injury_c and os.path.exists(self.injury_c):
+            C_raw = pd.read_parquet(self.injury_c)
+            inj_frames.append(self._prep_injury_c(C_raw))
+
+        injury_db = pd.concat(inj_frames, ignore_index=True)
+        # De-dupe across sources by same player/team/day; keep first chronologically
+        injury_db = (injury_db
+                     .sort_values('DATE')
+                     .drop_duplicates(subset=['TEAM', 'DATE', 'norm'], keep='first'))
 
         gamelogs = pd.read_parquet(self.gamelogs_path)
-        lineups = pd.read_parquet(self.lineups_path)
-        onoff = pd.read_parquet(self.onoff_path)
+        lineups  = pd.read_parquet(self.lineups_path)
+        onoff    = pd.read_parquet(self.onoff_path)
 
         # Basic cleanup
         gamelogs = gamelogs.dropna().reset_index(drop=True)
@@ -288,19 +379,8 @@ class ScrapeLoadPipeline:
                 gamelogs.select_dtypes('int64').apply(pd.to_numeric, downcast='integer')
             )
 
-        # Injury matching key
-        injury_db['norm'] = injury_db['PLAYER'].apply(normalize_name)
-        gamelogs['norm'] = (
-            gamelogs['athlete_display_name']
-              .str.replace(r'[^\w\s]', '', regex=True)
-              .str.replace(r'\b(?:[IVX]+)$', '', regex=True)
-              .str.strip()
-        )
-
-        # Dates
-        injury_db['DATE'] = pd.to_datetime(injury_db['DATE'], errors='coerce')
-        gamelogs['game_date'] = pd.to_datetime(gamelogs['game_date'], errors='coerce')
-        combined_df_merged['GAME_DATE'] = pd.to_datetime(combined_df_merged['GAME_DATE'], errors='coerce')
+        # CONSISTENT name normalization (match A/B/C helpers)
+        gamelogs['norm'] = gamelogs['athlete_display_name'].astype(str).apply(normalize_name)
 
         # Post-2020 filter
         injury_db = injury_db[injury_db['DATE'].dt.year >= 2021].copy()
@@ -473,6 +553,7 @@ def run_scrape_and_load(
     onoff_path: str = ONOFF_PATH,
     injury_a: str = INJURY_A,
     injury_b: str = INJURY_B,
+    injury_c: str = INJURY_C,
 ) -> pd.DataFrame:
     """
     Primary entry point.
@@ -494,6 +575,7 @@ def run_scrape_and_load(
         onoff_path=onoff_path,
         injury_a=injury_a,
         injury_b=injury_b,
+        injury_c=injury_c,
     )
 
     if ensure_scrape:

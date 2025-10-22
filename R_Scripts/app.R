@@ -45,7 +45,6 @@ PRIMARY_BLUE <- "#007AC1"
 # ==============================
 ui <- tagList(
   tags$head(
-    # CSS
     tags$style(HTML('
       .navbar { min-height: 64px; padding-top: 3px; padding-bottom: 3px; }
       .navbar-brand { display: flex; align-items: center; font-size: 1.4rem; }
@@ -56,16 +55,16 @@ ui <- tagList(
       .reactable .th, .reactable .td { color: #FFFFFF; }
       .reactable input[type="text"], .reactable select { color: black !important; }
 
-      /* Headers readable, cells compact */
+      /* Cells compact; headers can wrap so names stay readable */
       .reactable .rt-td { white-space: nowrap; }
       .reactable .rt-th { white-space: normal; line-height: 1.2; }
       .reactable .rt-thead .rt-th { padding-top: 8px; padding-bottom: 8px; }
       .reactable .rt-th, .reactable .rt-th .rt-resizable-header-content { overflow: visible; }
 
-      /* No hover highlight (we highlight only on click/selection) */
+      /* No hover highlight */
       .reactable .rt-tr:hover .rt-td { background: transparent !important; }
 
-      /* Table fills the card when narrow; scroll only when needed */
+      /* ===== Table fills the card; scroll only when needed ===== */
       #predictions_wrap { position: relative; overflow-x: auto; width: 100%; }
       #predictions_wrap .reactable,
       #predictions_wrap .html-widget,
@@ -74,38 +73,49 @@ ui <- tagList(
         width: max-content;     /* grow to content when many columns */
       }
 
-      /* Sticky search pinned to the scrollport top-right */
-      #predictions_wrap .sticky-search {
+      /* ===== Sticky toolbar (search + pagination) pinned to top-right of scrollport ===== */
+      #predictions_wrap .sticky-toolbar {
         position: sticky;
         top: 0;
         left: 0;
         right: 0;
         display: flex;
         justify-content: flex-end;
+        align-items: center;
+        gap: 10px;
         padding: 6px 6px 0 6px;
         z-index: 5;
         background: linear-gradient(90deg, rgba(18,18,18,0) 0%, rgba(18,18,18,0.9) 40%, rgba(18,18,18,1) 100%);
       }
-      #predictions_wrap .sticky-search .form-control {
-        width: 260px;
-        max-width: 260px;
+      #predictions_wrap .sticky-toolbar .form-control,
+      #predictions_wrap .sticky-toolbar .form-select {
+        height: 32px;
+        line-height: 32px;
+        padding-top: 2px;
+        padding-bottom: 2px;
         border: 1px solid #007AC1;
         box-shadow: none;
       }
-    ')),
-    # JS: live-inject CSS to hide/unhide columns (no table re-render → no page reset)
-    tags$script(HTML("
-      Shiny.addCustomMessageHandler('rt-hide-cols-css', function(msg){
-        var styleId = 'hide-cols-' + msg.id;
-        var node = document.getElementById(styleId);
-        if (!node) {
-          node = document.createElement('style');
-          node.id = styleId;
-          document.head.appendChild(node);
-        }
-        node.textContent = msg.css || '';
-      });
-    "))
+      #predictions_wrap .sticky-toolbar .pager {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      #predictions_wrap .sticky-toolbar .pager .btn {
+        padding: 2px 8px;
+        line-height: 1.2;
+        border-color: #007AC1;
+        color: #FFFFFF;
+      }
+      #predictions_wrap .sticky-toolbar .pager .btn:hover {
+        background: rgba(0,122,193,0.2);
+      }
+      #predictions_wrap .sticky-toolbar .page-info {
+        color: #BBBBBB;
+        font-size: 0.9rem;
+        padding: 0 2px;
+      }
+    '))
   ),
   
   navbarPage(
@@ -118,9 +128,10 @@ ui <- tagList(
       div(
         class = "container-fluid",
         style = "padding:2rem; background-color:#1e1e1e; color:white;",
-        div(class = "text-center mb-4",
-            h1("Welcome to NBA Player Stat Predictor", class = "display-4"),
-            p("Get next-game predictions for NBA players using machine learning models.")
+        div(
+          class = "text-center mb-4",
+          h1("Welcome to NBA Player Stat Predictor", class = "display-4"),
+          p("Get next-game predictions for NBA players using machine learning models.")
         ),
         fluidRow(
           div(class = "col-md-4", style = "padding:1rem;",
@@ -184,8 +195,18 @@ ui <- tagList(
               h2("Weekly Player Predictions", style = "color:white;"),
               div(
                 id = "predictions_wrap",
-                div(class = "sticky-search",
-                    textInput("pred_search", NULL, placeholder = "Search players, teams, stats…", width = "260px")
+                # Sticky toolbar: search + page controls
+                div(class = "sticky-toolbar",
+                    textInput("pred_search", NULL, placeholder = "Search players, teams, stats…", width = "260px"),
+                    div(class="pager",
+                        actionButton("page_prev", "‹", class = "btn btn-sm btn-outline-primary"),
+                        numericInput("page_num", NULL, value = 1, min = 1, step = 1, width = "80px"),
+                        span(class="page-info", "of"),
+                        textOutput("page_max", container = span),
+                        actionButton("page_next", "›", class = "btn btn-sm btn-outline-primary"),
+                        selectInput("page_size", NULL,
+                                    choices = c(5,10,15,20,25,100), selected = 10, width = "90px")
+                    )
                 ),
                 reactableOutput("predictions_table")
               )
@@ -208,7 +229,7 @@ ui <- tagList(
       )
     ),
     
-    # --- GUIDE (RESTORED) ---
+    # --- GUIDE ---
     tabPanel(
       "Guide",
       div(
@@ -216,60 +237,7 @@ ui <- tagList(
         style = "padding:2rem; background:#121212; color:#FFFFFF;",
         h2("How to Interpret Predictions & Metrics"),
         p(class = "text-muted", style = "color:#BBBBBB;",
-          "This page explains all prediction columns and evaluation metrics used in the app."),
-        tags$hr(style = "border-top: 1px solid #007AC1;"),
-        
-        h3("Predicted Stats"),
-        p("Each stat is predicted for the player's next game."),
-        tags$ul(
-          tags$li(tags$b("3-Point FG"), ": Predicted three-pointers made (not attempted)."),
-          tags$li(tags$b("Rebounds"), ": Total rebounds (offensive + defensive)."),
-          tags$li(tags$b("Assists"), ": Recorded assists."),
-          tags$li(tags$b("Steals"), ": Recorded steals."),
-          tags$li(tags$b("Blocks"), ": Recorded blocks."),
-          tags$li(tags$b("Points"), ": Total points scored.")
-        ),
-        
-        h4("Uncertainty Columns (per stat)"),
-        tags$ul(
-          tags$li(tags$b("Mean"), ": Expected value of the stat."),
-          tags$li(tags$b("Median"), ": 50th percentile."),
-          tags$li(tags$b("Lower (q10)"), ": 10th percentile — closer to mean ⇒ tighter, much lower ⇒ more downside risk."),
-          tags$li(tags$b("Upper (q90)"), ": 90th percentile — much higher than mean ⇒ more upside spread."),
-          tags$li(tags$b("PI80 Width") , ": (Upper − Lower). High ⇒ big plausible range; Low ⇒ tight expectation."),
-          tags$li(tags$b("Pred Std")   , ": Predictive std (epistemic + aleatoric). High ⇒ wide outcomes; Low ⇒ consistent."),
-          tags$li(tags$b("Epi Std")    , ": What the model doesn’t know (context/data limits). High ⇒ new/shifted context."),
-          tags$li(tags$b("Ale Std")    , ": Inherent randomness. High ⇒ volatile stat/matchup."),
-          tags$li(tags$b("Std80 Lower / Std80 Upper"), ": ±1.2816 × Pred Std (≈80%). Wider ⇒ more uncertainty.")
-        ),
-        
-        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
-        
-        h3("Metrics"),
-        p("Computed on historical data to judge calibration and accuracy."),
-        tags$ul(
-          tags$li(tags$b("RMSE (Mean)"), ": Lower is better; punishes big misses."),
-          tags$li(tags$b("MAE (Mean)"),  ": Lower is better; typical miss size."),
-          tags$li(tags$b("R\u00B2"),     ": Higher is better."),
-          tags$li(tags$b("RMSE/MAE (Median)"), ": Same metrics for median predictions."),
-          tags$li(tags$b("Pinball Loss (q=0.10/0.50/0.90)"), ": Lower is better; quantile accuracy."),
-          tags$li(tags$b("80% PI Coverage (q10–q90)"), ": ≈80% is ideal (wider ⇒ too wide; lower ⇒ too narrow)."),
-          tags$li(tags$b("PI80 Width"), ": Lower is tighter—balance with coverage."),
-          tags$li(tags$b("Below q10 / Above q50 / Above q90"), ": Targets ≈10% / 50% / 10%; deviations ⇒ miscalibration."),
-          tags$li(tags$b("STD 80% Coverage (± z·std)"), ": ≈80% ⇒ std well-scaled."),
-          tags$li(tags$b("Mean Std (Predictive/Epistemic/Aleatoric)"), ": Lower ⇒ more confidence (watch calibration)."),
-          tags$li(tags$b("Bias (Mean Error)"), ": Closer to 0 is better (sign = over/under)."),
-          tags$li(tags$b("Uncertainty–Error Corr"), ": Positive desired—model is uncertain when it tends to miss.")
-        ),
-        
-        tags$hr(style = "border-top: 1px solid #007AC1; margin: 2rem 0;"),
-        
-        h4("Quick Tips"),
-        tags$ul(
-          tags$li("For conservative plays, focus on ", tags$b("Lower (q10)"), " and small ", tags$b("PI80 Width"), "."),
-          tags$li("If ", tags$b("Pred Std"), " is high, check whether it's driven by ", tags$b("Epi Std"), " or ", tags$b("Ale Std"), "."),
-          tags$li("Good calibration: coverage near 80% and tail rates near 10%/50%/10%.")
-        )
+          "This page explains all prediction columns and evaluation metrics used in the app.")
       )
     )
   ),
@@ -327,7 +295,6 @@ server <- function(input, output, session) {
   strip_html <- function(x) gsub("<[^>]*>", "", x)
   slug <- function(x) tolower(gsub("[^a-z0-9]+", "-", x))
   
-  # Build full table (all columns present)
   make_table_df <- function(df_raw) {
     if (!"headshot_url" %in% names(df_raw)) df_raw$headshot_url <- ""
     required_id_cols <- c("athlete_display_name","team_abbreviation",
@@ -408,17 +375,17 @@ server <- function(input, output, session) {
         `Blocks (Std80 Lower)` = blocks_std80_lower,
         `Blocks (Std80 Upper)` = blocks_std80_upper,
         
-        # 3-Point FG
-        `3-Point FG (Mean)`        = three_point_field_goals_made_mean,
-        `3-Point FG (Median)`      = three_point_field_goals_made_median,
-        `3-Point FG (Lower)`       = three_point_field_goals_made_lower,
-        `3-Point FG (Upper)`       = three_point_field_goals_made_upper,
-        `3-Point FG (PI80 Width)`  = three_point_field_goals_made_pi80_width,
-        `3-Point FG (Pred Std)`    = three_point_field_goals_made_std_pred,
-        `3-Point FG (Epi Std)`     = three_point_field_goals_made_std_epistemic,
-        `3-Point FG (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
-        `3-Point FG (Std80 Lower)` = three_point_field_goals_made_std80_lower,
-        `3-Point FG (Std80 Upper)` = three_point_field_goals_made_std80_upper
+        # 3PM
+        `3PM (Mean)`        = three_point_field_goals_made_mean,
+        `3PM (Median)`      = three_point_field_goals_made_median,
+        `3PM (Lower)`       = three_point_field_goals_made_lower,
+        `3PM (Upper)`       = three_point_field_goals_made_upper,
+        `3PM (PI80 Width)`  = three_point_field_goals_made_pi80_width,
+        `3PM (Pred Std)`    = three_point_field_goals_made_std_pred,
+        `3PM (Epi Std)`     = three_point_field_goals_made_std_epistemic,
+        `3PM (Ale Std)`     = three_point_field_goals_made_std_aleatoric,
+        `3PM (Std80 Lower)` = three_point_field_goals_made_std80_lower,
+        `3PM (Std80 Upper)` = three_point_field_goals_made_std80_upper
       ) %>%
       select(
         Player, Team, Opponent, Date, HomeAway,
@@ -435,16 +402,15 @@ server <- function(input, output, session) {
         `Steals (PI80 Width)`, `Steals (Pred Std)`, `Steals (Epi Std)`,
         `Steals (Ale Std)`, `Steals (Std80 Lower)`, `Steals (Std80 Upper)`,
         `Blocks (Mean)`, `Blocks (Lower)`, `Blocks (Median)`, `Blocks (Upper)`,
-        `Blocks (PI80 Width)`, `Blocks (Pred Std)`,
-        `Blocks (Epi Std)`, `Blocks (Ale Std)`,
-        `Blocks (Std80 Lower)`, `Blocks (Std80 Upper)`,
-        `3-Point FG (Mean)`, `3-Point FG (Lower)`, `3-Point FG (Median)`, `3-Point FG (Upper)`,
-        `3-Point FG (PI80 Width)`, `3-Point FG (Pred Std)`, `3-Point FG (Epi Std)`,
-        `3-Point FG (Ale Std)`, `3-Point FG (Std80 Lower)`, `3-Point FG (Std80 Upper)`
+        `Blocks (PI80 Width)`, `Blocks (Pred Std)`, `Blocks (Epi Std)`,
+        `Blocks (Ale Std)`, `Blocks (Std80 Lower)`, `Blocks (Std80 Upper)`,
+        `3PM (Mean)`, `3PM (Lower)`, `3PM (Median)`, `3PM (Upper)`,
+        `3PM (PI80 Width)`, `3PM (Pred Std)`, `3PM (Epi Std)`,
+        `3PM (Ale Std)`, `3PM (Std80 Lower)`, `3PM (Std80 Upper)`
       )
   }
   
-  # All-column search (case-insensitive), ignoring HTML in Player
+  # all-column search (case-insensitive), ignores HTML in Player
   filter_by_query <- function(df, q) {
     q <- tolower(trimws(q %||% ""))
     if (q == "") return(df)
@@ -454,7 +420,6 @@ server <- function(input, output, session) {
     df[hits, , drop = FALSE]
   }
   
-  # Column classes / selectors
   compute_show_cols <- function(df_all, selected_labels) {
     meta <- c("Player","Team","Opponent","Date","HomeAway")
     selected_meta  <- intersect(selected_labels, meta)
@@ -469,13 +434,6 @@ server <- function(input, output, session) {
     c(selected_meta, stat_cols)
   }
   
-  make_hide_css <- function(all_cols, show_cols) {
-    hide <- setdiff(all_cols, show_cols)
-    if (!length(hide)) return("")
-    sel <- paste(paste0(".", paste0("col-", slug(hide))), collapse = ",")
-    paste0(sel, "{display:none !important;}")
-  }
-  
   build_col_defs <- function(df_any) {
     defs <- setNames(vector("list", length(names(df_any))), names(df_any))
     for (nm in names(df_any)) {
@@ -483,7 +441,7 @@ server <- function(input, output, session) {
       defs[[nm]] <- colDef(
         html     = identical(nm, "Player"),
         align    = if (is.numeric(df_any[[nm]])) "right" else "center",
-        minWidth = if (nm == "Player") 200 else 110,  # stretchable base
+        minWidth = if (nm == "Player") 200 else 110,  # can stretch (no maxWidth caps)
         name     = if (nm == "HomeAway") "Home/Away" else NULL,
         class    = cls,
         headerClass = cls,
@@ -493,25 +451,53 @@ server <- function(input, output, session) {
     defs
   }
   
+  # ---- Sticky pagination helpers (compat: no pageSize in updateReactable) ----
+  page_size_rv <- reactiveVal(10L)     # source of truth for defaultPageSize
+  table_redraw <- reactiveVal(0L)      # bump to force re-render when size changes
+  
+  filtered_df <- reactive({
+    filter_by_query(make_table_df(preds()), input$pred_search)
+  })
+  
+  total_pages <- reactive({
+    sz <- as.numeric(page_size_rv())
+    n  <- nrow(filtered_df())
+    max(1L, ceiling(n / sz))
+  })
+  
+  output$page_max <- renderText({
+    as.character(total_pages())
+  })
+  
   # --------------------------
-  # Render predictions table (single render; column toggles via CSS -> no page reset)
+  # Render predictions table
   # --------------------------
   output$predictions_table <- renderReactable({
-    df_all <- make_table_df(preds())
-    df_all <- filter_by_query(df_all, input$pred_search)   # search can re-render (expected)
-    col_defs <- build_col_defs(df_all)
+    table_redraw()  # depend so page size changes re-render safely
     
-    tbl <- reactable(
-      df_all,
+    df_all <- filtered_df()
+    
+    labels <- input$selected_columns
+    if (is.null(labels) || !length(labels)) {
+      labels <- c("Player","Team","Opponent","Date","HomeAway",
+                  "Points","Rebounds","Assists","Steals","Blocks","3PM")
+    }
+    show_cols <- compute_show_cols(df_all, labels)
+    df_show   <- df_all[, show_cols, drop = FALSE]
+    col_defs  <- build_col_defs(df_show)
+    
+    reactable(
+      df_show,
       columns   = c(list(.selection = colDef(show = FALSE)), col_defs),  # hide the radio dot
       selection = "single",
       onClick   = "select",
       highlight = FALSE,
       pagination = TRUE,
-      defaultPageSize = 10,
-      showPageSizeOptions = TRUE,
-      pageSizeOptions   = c(5, 10, 15, 20, 25, 100),
-      searchable = FALSE,         # using sticky search
+      defaultPageSize = as.numeric(page_size_rv()),
+      showPageSizeOptions = FALSE,  # custom sticky control
+      showPageInfo        = FALSE,
+      showPagination      = FALSE,
+      searchable = FALSE,           # using the sticky search
       compact    = TRUE,
       fullWidth  = TRUE,
       defaultColDef = colDef(minWidth = 110),
@@ -526,59 +512,60 @@ server <- function(input, output, session) {
         )
       )
     )
-    
-    # Initialize column visibility once (no dependency on input$selected_columns here)
-    init_labels <- isolate(input$selected_columns)
-    if (is.null(init_labels) || !length(init_labels)) {
-      init_labels <- c("Player","Team","Opponent","Date","HomeAway",
-                       "Points","Rebounds","Assists","Steals","Blocks","3-Point FG")
-    }
-    show_cols <- compute_show_cols(df_all, init_labels)
-    css_text  <- make_hide_css(names(df_all), show_cols)
-    
-    htmlwidgets::onRender(
-      tbl,
-      sprintf(
-        "function(el,x){
-           var id = 'predictions_table';
-           var css = %s;
-           var styleId = 'hide-cols-' + id;
-           var node = document.getElementById(styleId);
-           if (!node) {
-             node = document.createElement('style');
-             node.id = styleId;
-             document.head.appendChild(node);
-           }
-           node.textContent = css || '';
-         }",
-        jsonlite::toJSON(css_text, auto_unbox = TRUE)
-      )
-    )
   })
   
-  # When the user changes the selector: inject new CSS (no re-render → no page reset)
-  observeEvent(input$selected_columns, ignoreInit = TRUE, {
-    df_all  <- make_table_df(preds())
-    df_all  <- filter_by_query(df_all, input$pred_search)
-    show    <- compute_show_cols(df_all, input$selected_columns)
-    css_txt <- make_hide_css(names(df_all), show)
-    session$sendCustomMessage("rt-hide-cols-css", list(
-      id  = "predictions_table",
-      css = css_txt
-    ))
-  })
-  
-  # If data refreshes and table re-renders, reapply CSS once
-  observeEvent(preds(), ignoreInit = TRUE, {
-    df_all  <- make_table_df(preds())
-    df_all  <- filter_by_query(df_all, isolate(input$pred_search))
-    show    <- compute_show_cols(df_all, isolate(input$selected_columns))
-    css_txt <- make_hide_css(names(df_all), show)
+  # ------ Sticky pagination controls (NO pageSize arg to updateReactable) ------
+  # Page size change → re-render with new defaultPageSize, then restore page
+  observeEvent(input$page_size, ignoreInit = TRUE, {
+    sz <- as.numeric(input$page_size)
+    n  <- nrow(isolate(filtered_df()))
+    tp <- max(1L, ceiling(n / sz))
+    cur_page <- min(max(1L, as.integer(isolate(input$page_num) %||% 1L)), tp)
+    
+    page_size_rv(sz)                 # update defaultPageSize source of truth
+    table_redraw(table_redraw() + 1) # force re-render
+    
+    updateNumericInput(session, "page_num", value = cur_page)
     session$onFlushed(function() {
-      session$sendCustomMessage("rt-hide-cols-css", list(
-        id  = "predictions_table",
-        css = css_txt
-      ))
+      reactable::updateReactable("predictions_table", page = cur_page)
+    }, once = TRUE)
+  })
+  
+  # Prev / Next buttons
+  observeEvent(input$page_prev, {
+    new_page <- max(1L, as.integer(isolate(input$page_num) %||% 1L) - 1L)
+    updateNumericInput(session, "page_num", value = new_page)
+    reactable::updateReactable("predictions_table", page = new_page)
+  })
+  observeEvent(input$page_next, {
+    new_page <- min(total_pages(), as.integer(isolate(input$page_num) %||% 1L) + 1L)
+    updateNumericInput(session, "page_num", value = new_page)
+    reactable::updateReactable("predictions_table", page = new_page)
+  })
+  
+  # Manual page number edit
+  observeEvent(input$page_num, ignoreInit = TRUE, {
+    pg <- as.integer(input$page_num); if (is.na(pg)) return()
+    pg <- min(total_pages(), max(1L, pg))
+    if (pg != input$page_num) updateNumericInput(session, "page_num", value = pg)
+    reactable::updateReactable("predictions_table", page = pg)
+  })
+  
+  # Re-clamp page when search text changes (row count changes)
+  observeEvent(input$pred_search, ignoreInit = TRUE, {
+    tp <- total_pages()
+    pg <- min(tp, max(1L, as.integer(isolate(input$page_num) %||% 1L)))
+    if (pg != isolate(input$page_num)) {
+      updateNumericInput(session, "page_num", value = pg)
+      reactable::updateReactable("predictions_table", page = pg)
+    }
+  })
+  
+  # Keep current page after column set changes (table re-render happens)
+  observeEvent(input$selected_columns, ignoreInit = TRUE, {
+    cur_page <- as.integer(isolate(input$page_num) %||% 1L)
+    session$onFlushed(function() {
+      reactable::updateReactable("predictions_table", page = cur_page)
     }, once = TRUE)
   })
   

@@ -113,7 +113,7 @@ def run_preprocessing(
 
     # ----------- Temporal split -----------
     train_df = gamelogs[gamelogs["season"] < season_cutoff].copy()
-    val_df   = gamelogs[gamelogs["season"] >= season_cutoff].copy()
+    val_df   = gamelogs[gamelogs["season"] == season_cutoff].copy()
 
     # Ensure categoricals are strings (stable OHE categories)
     categorical_features = list(categorical_feats0)
@@ -148,8 +148,13 @@ def run_preprocessing(
             X_train_embed[:, j] = np.clip(X_train_embed[:, j], 0, num_embeddings - 1)
             X_val_embed[:, j]   = np.clip(X_val_embed[:, j],   0, num_embeddings - 1)
 
-        # quick diagnostics (caller can log if desired)
-        _ = {embedding_features[j]: float((X_val_embed[:, j] == 0).mean()) for j in range(len(embedding_features))}
+        # --- Diagnostic: Unknown rates per embedding feature ---
+        unk_rates = {
+            embedding_features[j]: float((X_val_embed[:, j] == 0).mean())
+            for j in range(len(embedding_features))
+        }
+        print("[INFO] Unknown embedding rates:", unk_rates)
+    
     else:
         embedding_sizes = []
         X_train_embed = np.zeros((len(train_df), 0), dtype=np.int64)
@@ -179,7 +184,7 @@ def run_preprocessing(
 
     categorical_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
-        ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True, dtype=np.float32)),
+        ("ohe", OneHotEncoder(drop="if_binary", handle_unknown="ignore", sparse_output=True, dtype=np.float32)),
     ])
 
     standard_numeric_transformer = Pipeline([

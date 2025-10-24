@@ -35,8 +35,11 @@ def run_feature_engineering(
     cache_write: bool = True,
     targets: Optional[List[str]] = None,
     targets2: Optional[List[str]] = None,
-    id_col: str = "GAME_ID",   # will also look for lowercase fallback "game_id"
+    id_col: str = "GAME_ID",
+    force_recompute: bool = False,
+    ensure_fe: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+
     """
     Feature engineering stage.
     - Input: preprocessed `gamelogs` with columns used below.
@@ -54,43 +57,76 @@ def run_feature_engineering(
     """
     targets = targets or list(DEFAULT_TARGETS)
     targets2 = targets2 or list(DEFAULT_TARGETS2)
-
+    
+    # Treat ensure_fe as an alias for forcing recompute (same spirit as ensure_scrape)
+    force_recompute = force_recompute or ensure_fe
+    
     # ---------------- Cache short-circuit (HARD STOP if no new IDs) ----------------
-    # Accept either "GAME_ID" or "game_id" in either frame.
     def _resolve_idcol(df: pd.DataFrame, preferred: str) -> Optional[str]:
         if preferred in df.columns:
             return preferred
         low = preferred.lower()
         return low if low in df.columns else None
-
-    if cache_read and os.path.exists(save_path):
-        fe_cached = pd.read_parquet(save_path)
-        all_star_teams = ["DUR", "LEB", "GIA", "WEST", "EAST", "CAN", "CHK", "KEN", "SHQ"]
-        in_id = _resolve_idcol(gamelogs, id_col)
-        fe_id = _resolve_idcol(fe_cached, id_col)
-
-        if in_id and fe_id:
-            # 1) Apply the same early FE exclusion to the incoming frame
-            g_in = gamelogs
-            if "team_abbreviation" in g_in.columns:
-                g_in = g_in[~g_in["team_abbreviation"].isin(all_star_teams)]
-        
-            # 2) Compare as integers (no strings)
-            incoming_ids = pd.Index(
-                pd.to_numeric(g_in[in_id], errors="coerce").dropna().astype("int32").unique()
-            )
-            cached_ids = pd.Index(
-                pd.to_numeric(fe_cached[fe_id], errors="coerce").dropna().astype("int32").unique()
-            )
-        
-            new_ids = incoming_ids.difference(cached_ids)
-            if len(new_ids) == 0:
-                print(f"No new {in_id}s. Loading existing feature parquet and stopping: {save_path}")
-                return fe_cached, _build_feature_groups(fe_cached, targets)
-            print(f"Detected {len(new_ids)} new {in_id}(s) -> recomputing features.")
-        else:
-            print(f"'{id_col}' not present in both inputs (checked upper/lower); proceeding to recompute features.")
-
+    
+    if force_recompute:
+        print(f"Force-recompute requested → ignoring cached features at {save_path}")
+    else:
+        if cache_read and os.path.exists(save_path):
+            fe_cached = pd.read_parquet(save_path)
+            all_star_teams = ["DUR", "LEB", "GIA", "WEST", "EAST", "CAN", "CHK", "KEN", "SHQ"]
+            in_id = _resolve_idcol(gamelogs, id_col)
+            fe_id = _resolve_idcol(fe_cached, id_col)
+    
+            if in_id and fe_id:
+                # 1) Apply the same early FE exclusion to the incoming frame
+                g_in = gamelogs
+                if "team_abbreviation" in g_in.columns:
+                    g_in = g_in[~g_in["team_abbreviation"].isin(all_star_teams)]
+    
+                # 2) Compare IDs as strings to avoid dtype mismatches
+                incoming_ids = pd.Index(g_in[in_id].astype(str).unique())
+                cached_ids   = pd.Index(fe_cached[fe_id].astype(str).unique())
+                new_ids = incoming_ids.difference(cached_ids)
+    
+                if len(new_ids) == 0:
+                    # Detect updates to existing IDs (newer dates or increased row counts)
+                    can_compare_dates = ("game_date" in g_in.columns) and ("game_date" in fe_cached.columns)
+                    updates_due_to_dates = 0
+                    updates_due_to_counts = 0
+    
+                    fe_cmp = fe_cached
+                    if "team_abbreviation" in fe_cmp.columns:
+                        fe_cmp = fe_cmp[~fe_cmp["team_abbreviation"].isin(all_star_teams)]
+    
+                    # Compare max game_date per ID
+                    if can_compare_dates:
+                        g_in_dates = pd.to_datetime(g_in["game_date"], errors="coerce")
+                        fe_dates   = pd.to_datetime(fe_cmp["game_date"], errors="coerce")
+                        in_latest = g_in.assign(_gd=g_in_dates).groupby(in_id)["_gd"].max()
+                        fe_latest = fe_cmp.assign(_gd=fe_dates).groupby(fe_id)["_gd"].max()
+                        fe_latest = fe_latest.reindex(in_latest.index)
+                        newer_mask = in_latest.gt(fe_latest.fillna(pd.Timestamp(0)))
+                        updates_due_to_dates = int(newer_mask.sum())
+    
+                    # Row count increases per ID (e.g., more player-rows)
+                    in_counts = g_in.groupby(in_id).size()
+                    fe_counts = fe_cmp.groupby(fe_id).size().reindex(in_counts.index).fillna(0).astype(int)
+                    count_increase_mask = in_counts.gt(fe_counts)
+                    updates_due_to_counts = int(count_increase_mask.sum())
+    
+                    if updates_due_to_dates > 0 or updates_due_to_counts > 0:
+                        print(
+                            f"Detected updates for {updates_due_to_dates} existing {in_id}(s) "
+                            f"and count increases for {updates_due_to_counts} → recomputing features."
+                        )
+                    else:
+                        print(f"No new {in_id}s and no updates. Loading existing feature parquet and stopping: {save_path}")
+                        return fe_cached, _build_feature_groups(fe_cached, targets or list(DEFAULT_TARGETS))
+                else:
+                    print(f"Detected {len(new_ids)} new {in_id}(s) → recomputing features.")
+            else:
+                print(f"'{id_col}' not present in both inputs (checked upper/lower); proceeding to recompute features.")
+    
     print("Running full feature engineering pipeline")
     fe = gamelogs.copy()
 
@@ -184,7 +220,7 @@ def run_feature_engineering(
     base_sort = [c for c in ["athlete_display_name", "game_date", "season", "team_abbreviation"] if c in fe.columns]
     if len(base_sort) >= 2:
         fe = fe.sort_values(base_sort).reset_index(drop=True)
-
+        
     # Num starters injured that day (safe if team/date exist)
     if {"game_date", "team_abbreviation"}.issubset(fe.columns):
         fe["num_starters_injured"] = (
@@ -722,7 +758,12 @@ def _build_feature_groups(fe: pd.DataFrame, targets: List[str]) -> Dict[str, Lis
     numeric_features = [
         c
         for c in lagged_rolling_features
-        + ["days_since_last_game", "num_starters_injured", "opp_games_last_7d", "opp_days_since_last_game"]
+        + [
+            "days_since_last_game",
+            "num_starters_injured",
+            "opp_games_last_7d",
+            "opp_days_since_last_game"
+        ]
         if c in fe.columns and c not in prior_features
     ]
 
@@ -734,7 +775,7 @@ def _build_feature_groups(fe: pd.DataFrame, targets: List[str]) -> Dict[str, Lis
         "starter_injured",
         "is_back_to_back",
         "opp_is_back_to_back",
-        "team_primary_scorer",
+        "team_primary_scorer"
     ]
     categorical_features = [c for c in categorical_features if c in fe.columns]
 

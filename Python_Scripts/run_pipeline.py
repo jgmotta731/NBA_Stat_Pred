@@ -21,10 +21,10 @@ pd.set_option('display.max_columns', None)
 
 def main() -> None:
     # 1) Scrape & load (writes/caches parquets internally)
-    gamelogs = run_scrape_and_load()
+    gamelogs = run_scrape_and_load(ensure_scrape=False)
 
     # 2) Feature engineering
-    gamelogs, feature_groups = run_feature_engineering(gamelogs)
+    gamelogs, feature_groups = run_feature_engineering(gamelogs, ensure_fe=False)
 
 
     # 3) Preprocessing
@@ -73,7 +73,6 @@ def main() -> None:
         print(results_df)
     except Exception:
         pass
-
 
 if __name__ == "__main__":
     main()

@@ -147,7 +147,7 @@ ui <- tagList(
           div(class = "col-md-4", style = "padding:1rem;",
               div(class = "card h-100", style = "background:#1e1e1e; border:1px solid #007AC1;",
                   div(class="card-body", h3("Key Stats", class="card-title"),
-                      p("Predictions for 3-PT FG, Rebounds, Assists, Steals, Blocks, Points.")
+                      p("Predictions for 3PM, Rebounds, Assists, Steals, Blocks, Points.")
                   )))
         ),
         div(style = "text-align:center; margin-top:2rem;",

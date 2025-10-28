@@ -47,7 +47,7 @@ def set_inference_seed(seed: int = 42):
 def current_season_bounds(today=None):
     """
     Returns (start_year, end_year) for the current NBA season.
-    Oct–Dec → season N–(N+1); Jan–Sep → (N-1)–N.
+    Oct–Dec -> season N–(N+1); Jan–Sep -> (N-1)–N.
     """
     today = today or date.today()
     if today.month >= 10:   # Oct–Dec
@@ -103,7 +103,7 @@ def main():
     targets              = feature_groups["targets"]  # ['three_point_field_goals_made', ..., 'points']
 
     # ---------------------------------------------------
-    # Step 3: upcoming schedule → build prediction rows
+    # Step 3: upcoming schedule -> build prediction rows
     # ---------------------------------------------------
     if not os.path.exists(SCHEDULE_PATH):
         raise FileNotFoundError(f"Schedule not found at {SCHEDULE_PATH}")
@@ -280,15 +280,76 @@ def main():
         Xp_embed[:, j] = np.clip(Xp_embed[:, j], 0, num_embeddings - 1)
     Xp_embed_tensor = torch.tensor(Xp_embed, dtype=torch.long, device=device)
     
-    # numeric block via training preprocessor
-    Xp = sched[preprocessor.named_steps["transform"].feature_names_in_]
-    Xp_proc_base = preprocessor.transform(Xp)
-    Xp_proc = pd.DataFrame(Xp_proc_base, columns=preprocessor.get_feature_names_out())
+    # ===================== REPLACEMENT START =====================
+    # Align sched to the exact input signature the preprocessor was fit on.
+    transformer = preprocessor.named_steps.get("transform", preprocessor)
+    if not hasattr(transformer, "feature_names_in_"):
+        raise RuntimeError(
+            "Preprocessor/transformer has no feature_names_in_; "
+            "ensure it was fit on a DataFrame."
+        )
+    expected = list(transformer.feature_names_in_)
     
-    # priors (expanding_mean/std for the 6 targets, already in prior_features order)
+    # If merge created *_latest columns, map them back to the base names the model expects.
+    to_rename = {}
+    for c in list(sched.columns):
+        if c.endswith("_latest"):
+            base = c[:-7]  # strip suffix
+            if base in expected and base not in sched.columns:
+                to_rename[c] = base
+    if to_rename:
+        sched = sched.rename(columns=to_rename)
+    
+    # Make sure every expected column exists (missing -> NaN so your imputers can handle them),
+    # and keep the exact expected order for the transformer.
+    Xp = sched.reindex(columns=expected)
+    
+    # Transform using your trained preprocessor
+    Xp_proc_base = preprocessor.transform(Xp)
+    
+    # Robust output column names from the preprocessor
+    try:
+        out_cols = preprocessor.get_feature_names_out().tolist()
+    except Exception:
+        out_cols = [f"f{i}" for i in range(Xp_proc_base.shape[1])]
+    
+    Xp_proc = pd.DataFrame(Xp_proc_base, columns=out_cols)
+    
+    # ---- Priors (expanding mean/std per target) ----
+    # Ensure prior columns exist; any missing will be imputed by prior_pipeline.
+    missing_priors = [c for c in prior_features if c not in sched.columns]
+    if missing_priors:
+        for c in missing_priors:
+            sched[c] = np.nan
+    # ---- Injury-aware dampener for priors (inference-only; no retrain) ----
+    eps = 1e-6
+    if {"minutes_ewm_mean_span21", "minutes_expanding_mean"} <= set(sched.columns):
+        min_ratio = (sched["minutes_ewm_mean_span21"] / (sched["minutes_expanding_mean"] + eps)).clip(0.2, 1.0)
+    else:
+        min_ratio = pd.Series(1.0, index=sched.index)  # neutral if minutes not available
+    
+    for t in targets:
+        prior_mean_col = f"{t}_expanding_mean"
+        prior_std_col  = f"{t}_expanding_std"
+        recent_col     = f"{t}_ewm_mean_span21"  # if present
+    
+        if prior_mean_col in sched.columns:
+            if recent_col in sched.columns:
+                base = sched[prior_mean_col].replace(0, np.nan)
+                prod_ratio = (sched[recent_col] / base).fillna(1.0).clip(0.2, 1.0)
+                w = np.minimum(min_ratio, prod_ratio)
+            else:
+                w = min_ratio
+    
+            # shrink prior mean; inflate uncertainty when we shrink
+            sched[prior_mean_col] = sched[prior_mean_col] * w
+            if prior_std_col in sched.columns:
+                sched[prior_std_col] = sched[prior_std_col] * (1.0 + (1.0 - w))
+
     Xp_prior = prior_pipeline.transform(sched[prior_features]).astype(np.float32)
     Xp_prior_tensor = torch.tensor(Xp_prior, dtype=torch.float32, device=device)
-    
+    # ====================== REPLACEMENT END ======================
+
     # final numeric tensor (drop embed cols; there is no 'target' column at inference)
     Xp_num_tensor = torch.tensor(
         Xp_proc.drop(columns=[c for c in embedding_features if c in Xp_proc.columns], errors="ignore").values,
@@ -593,7 +654,7 @@ def main():
                 pass
             return names
     
-        # nothing worked → fail clearly
+        # nothing worked -> fail clearly
         raise RuntimeError("Prop name fetch failed ({}). Filtering required but no source succeeded."
                            .format("; ".join(errors) or "no details"))
     
@@ -717,7 +778,7 @@ def main():
             else:
                 # NEW: success message
                 head = run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
-                print(f"Git push successful → origin/{BRANCH} (HEAD {head})")
+                print(f"Git push successful -> origin/{BRANCH} (HEAD {head})")
         else:
             print("No repo changes; nothing to commit.")
     except FileNotFoundError:

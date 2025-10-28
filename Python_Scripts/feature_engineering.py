@@ -69,7 +69,7 @@ def run_feature_engineering(
         return low if low in df.columns else None
     
     if force_recompute:
-        print(f"Force-recompute requested → ignoring cached features at {save_path}")
+        print(f"Force-recompute requested -> ignoring cached features at {save_path}")
     else:
         if cache_read and os.path.exists(save_path):
             fe_cached = pd.read_parquet(save_path)

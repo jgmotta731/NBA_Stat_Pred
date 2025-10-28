@@ -66,7 +66,7 @@ def normalize_name(name: str) -> str:
     if ',' in name:
         last, first = name.split(',', 1)
         name = f"{first.strip()} {last.strip()}"
-    # strip accents → ascii
+    # strip accents -> ascii
     name = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('utf-8')
     # kill punctuation
     name = re.sub(r'[^\w\s]', ' ', name)

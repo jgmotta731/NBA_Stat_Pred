@@ -145,9 +145,19 @@ player_raw <- load_nba_player_box(
   rename(player_id = athlete_id)
 
 # Save files
+cat(sprintf("[%s] Saving output files...\n", Sys.time()))
+
 write_parquet(player_raw, "datasets/nba_gamelogs.parquet")
+cat(sprintf("[%s] ✔ Saved 'datasets/nba_gamelogs.parquet'\n", Sys.time()))
+
 write_parquet(next_slate, "datasets/nba_schedule.parquet")
+cat(sprintf("[%s] ✔ Saved 'datasets/nba_schedule.parquet'\n", Sys.time()))
+
 write_parquet(injuries_bref, "datasets/current_injuries.parquet")
+cat(sprintf("[%s] ✔ Saved 'datasets/current_injuries.parquet'\n", Sys.time()))
+
+cat(sprintf("[%s] ✅ All parquet files successfully written.\n", Sys.time()))
+flush.console()
 
 # Clear memory
 rm(list = intersect(ls(), c("player_raw","next_slate", "injuries_bref")))
@@ -321,7 +331,10 @@ new_lineups <- bind_rows(all_lineups) %>%
   )
 
 lineup_stints <- bind_rows(existing_lineups, new_lineups)
+cat(sprintf("[%s] Saving lineup stints to parquet...\n", Sys.time()))
 write_parquet(lineup_stints, "datasets/lineup_stints.parquet")
+cat(sprintf("[%s] ✔ Saved 'datasets/lineup_stints.parquet'\n", Sys.time()))
+flush.console()
 
 # ------------------ On/Off Data ------------------
 
@@ -360,4 +373,7 @@ off_stats <- lineup_with_rosters %>%
 onoff_summary_new <- full_join(on_stats, off_stats, by = c("game_id", "team_id", "player_id"))
 onoff_summary <- bind_rows(existing_onoff, onoff_summary_new) %>% distinct()
 
-arrow::write_parquet(onoff_summary, "datasets/onoff_player_game.parquet")
+cat(sprintf("[%s] Saving on/off player game summary to parquet...\n", Sys.time()))
+write_parquet(onoff_summary, "datasets/onoff_player_game.parquet")
+cat(sprintf("[%s] ✔ Saved 'datasets/onoff_player_game.parquet'\n", Sys.time()))
+flush.console()
